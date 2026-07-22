@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<openbox_config xmlns="http://openbox.org/3.4/rc">
+  <applications>
+    <!-- 微信窗口：启动时放在屏幕左上角 (0,0)，避免在 8192x4096 虚拟屏幕中偏移到角落 -->
+    <application name="wechat" class="wechat">
+      <position force="yes">
+        <x>0</x>
+        <y>0</y>
+      </position>
+    </application>
+    <!-- 所有其他窗口也默认放在 (0,0) -->
+    <application class="*">
+      <position force="no">
+        <x>center</x>
+        <y>center</y>
+      </position>
+    </application>
+  </applications>
+</openbox_config>

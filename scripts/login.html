@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="robots" content="noindex, nofollow">
+<title>web_wechat</title>
+<style>
+  :root {
+    --brand: #1cbf61;
+    --brand-dark: #159c4e;
+    --brand-light: #2ad974;
+    --bg-1: #0a2e1c;
+    --bg-2: #0f3d24;
+    --bg-3: #051a0f;
+    --text: #ffffff;
+    --text-dim: #b8d4c4;
+    --text-muted: #7a9a89;
+    --card-bg: rgba(255, 255, 255, 0.06);
+    --card-border: rgba(255, 255, 255, 0.12);
+    --input-bg: rgba(0, 0, 0, 0.3);
+    --input-border: rgba(255, 255, 255, 0.14);
+    --error: #ff5b5b;
+    --radius: 14px;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  html, body {
+    height: 100%;
+    width: 100%;
+    overflow: hidden;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                 "Hiragino Sans GB", "Microsoft YaHei", "Helvetica Neue", sans-serif;
+    color: var(--text);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* 动态渐变背景层 */
+  .bg {
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    background:
+      radial-gradient(ellipse 80% 60% at 20% 20%, rgba(28, 191, 97, 0.25), transparent 60%),
+      radial-gradient(ellipse 70% 50% at 80% 80%, rgba(42, 217, 116, 0.18), transparent 60%),
+      radial-gradient(ellipse 100% 80% at 50% 110%, rgba(21, 156, 78, 0.22), transparent 70%),
+      linear-gradient(135deg, var(--bg-3) 0%, var(--bg-1) 50%, var(--bg-2) 100%);
+    background-size: 200% 200%, 200% 200%, 200% 200%, 100% 100%;
+    animation: bgShift 18s ease-in-out infinite alternate;
+  }
+
+  @keyframes bgShift {
+    0%   { background-position: 0% 0%, 100% 100%, 50% 50%, 0 0; }
+    100% { background-position: 100% 100%, 0% 0%, 50% 0%, 0 0; }
+  }
+
+  /* 微妙网格叠加层 */
+  .grid-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 1;
+    background-image:
+      linear-gradient(rgba(255,255,255,0.025) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,0.025) 1px, transparent 1px);
+    background-size: 44px 44px;
+    pointer-events: none;
+    -webkit-mask-image: radial-gradient(ellipse 70% 70% at 50% 50%, #000 30%, transparent 80%);
+            mask-image: radial-gradient(ellipse 70% 70% at 50% 50%, #000 30%, transparent 80%);
+  }
+
+  /* 浮动光斑 */
+  .orb {
+    position: fixed;
+    border-radius: 50%;
+    filter: blur(60px);
+    opacity: 0.5;
+    z-index: 1;
+    pointer-events: none;
+  }
+  .orb-1 {
+    width: 320px; height: 320px;
+    background: var(--brand);
+    top: -80px; left: -60px;
+    animation: float1 14s ease-in-out infinite alternate;
+  }
+  .orb-2 {
+    width: 260px; height: 260px;
+    background: var(--brand-light);
+    bottom: -60px; right: -40px;
+    animation: float2 16s ease-in-out infinite alternate;
+  }
+  @keyframes float1 {
+    0%   { transform: translate(0, 0) scale(1); }
+    100% { transform: translate(60px, 40px) scale(1.15); }
+  }
+  @keyframes float2 {
+    0%   { transform: translate(0, 0) scale(1); }
+    100% { transform: translate(-50px, -30px) scale(1.1); }
+  }
+
+  /* 主容器 */
+  .stage {
+    position: relative;
+    z-index: 2;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    padding: 24px;
+  }
+
+  .card {
+    width: 100%;
+    max-width: 400px;
+    background: var(--card-bg);
+    border: 1px solid var(--card-border);
+    border-radius: 22px;
+    padding: 44px 36px 36px;
+    backdrop-filter: blur(20px) saturate(160%);
+    -webkit-backdrop-filter: blur(20px) saturate(160%);
+    box-shadow:
+      0 20px 60px rgba(0, 0, 0, 0.4),
+      0 0 0 1px rgba(255, 255, 255, 0.04) inset,
+      0 1px 0 rgba(255, 255, 255, 0.08) inset;
+    animation: cardIn 0.6s cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+
+  @keyframes cardIn {
+    from { opacity: 0; transform: translateY(16px) scale(0.98); }
+    to   { opacity: 1; transform: translateY(0) scale(1); }
+  }
+
+  /* Logo 区 */
+  .brand {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    margin-bottom: 32px;
+  }
+  .logo {
+    width: 64px;
+    height: 64px;
+    border-radius: 18px;
+    background: linear-gradient(135deg, var(--brand-light), var(--brand-dark));
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-bottom: 16px;
+    box-shadow:
+      0 8px 24px rgba(28, 191, 97, 0.4),
+      0 0 0 1px rgba(255, 255, 255, 0.1) inset;
+    position: relative;
+  }
+  .logo svg { width: 34px; height: 34px; fill: #fff; }
+  .brand h1 {
+    font-size: 22px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    margin-bottom: 6px;
+  }
+  .brand p {
+    font-size: 13px;
+    color: var(--text-muted);
+    font-weight: 400;
+  }
+
+  /* 表单 */
+  .field {
+    position: relative;
+    margin-bottom: 18px;
+  }
+  .field label {
+    display: block;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-dim);
+    margin-bottom: 8px;
+    letter-spacing: 0.3px;
+  }
+  .field .input-wrap {
+    position: relative;
+  }
+  .field input {
+    width: 100%;
+    height: 48px;
+    padding: 0 16px 0 44px;
+    background: var(--input-bg);
+    border: 1px solid var(--input-border);
+    border-radius: 12px;
+    color: var(--text);
+    font-size: 15px;
+    font-family: inherit;
+    outline: none;
+    transition: all 0.2s ease;
+  }
+  .field input::placeholder {
+    color: var(--text-muted);
+  }
+  .field input:focus {
+    border-color: var(--brand);
+    background: rgba(28, 191, 97, 0.06);
+    box-shadow: 0 0 0 3px rgba(28, 191, 97, 0.15);
+  }
+  .field input:focus + .field-icon {
+    color: var(--brand);
+  }
+  .field-icon {
+    position: absolute;
+    left: 14px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 18px;
+    height: 18px;
+    color: var(--text-muted);
+    pointer-events: none;
+    transition: color 0.2s ease;
+  }
+
+  /* 密码可见切换 */
+  .toggle-pw {
+    position: absolute;
+    right: 12px;
+    top: 50%;
+    transform: translateY(-50%);
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    padding: 6px;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: color 0.2s ease, background 0.2s ease;
+  }
+  .toggle-pw:hover {
+    color: var(--text);
+    background: rgba(255, 255, 255, 0.06);
+  }
+  .toggle-pw svg { width: 18px; height: 18px; }
+
+  /* 提交按钮 */
+  .btn-submit {
+    width: 100%;
+    height: 50px;
+    margin-top: 8px;
+    border: none;
+    border-radius: 12px;
+    background: linear-gradient(135deg, var(--brand-light), var(--brand));
+    color: #fff;
+    font-size: 15px;
+    font-weight: 600;
+    font-family: inherit;
+    letter-spacing: 0.5px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    box-shadow:
+      0 6px 20px rgba(28, 191, 97, 0.35),
+      0 1px 0 rgba(255, 255, 255, 0.2) inset;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+  }
+  .btn-submit:hover {
+    transform: translateY(-1px);
+    box-shadow:
+      0 8px 24px rgba(28, 191, 97, 0.45),
+      0 1px 0 rgba(255, 255, 255, 0.2) inset;
+  }
+  .btn-submit:active {
+    transform: translateY(0);
+  }
+  .btn-submit:disabled {
+    opacity: 0.7;
+    cursor: not-allowed;
+    transform: none;
+  }
+  .btn-submit .spinner {
+    width: 16px;
+    height: 16px;
+    border: 2px solid rgba(255, 255, 255, 0.3);
+    border-top-color: #fff;
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* 错误提示 */
+  .error-msg {
+    display: none;
+    align-items: center;
+    gap: 8px;
+    margin-top: 16px;
+    padding: 10px 14px;
+    background: rgba(255, 91, 91, 0.1);
+    border: 1px solid rgba(255, 91, 91, 0.3);
+    border-radius: 10px;
+    color: var(--error);
+    font-size: 13px;
+    animation: shake 0.4s ease;
+  }
+  .error-msg.show { display: flex; }
+  .error-msg svg { width: 16px; height: 16px; flex-shrink: 0; }
+  @keyframes shake {
+    0%, 100% { transform: translateX(0); }
+    25% { transform: translateX(-6px); }
+    75% { transform: translateX(6px); }
+  }
+
+  /* 成功提示（登出后） */
+  .info-msg {
+    display: none;
+    margin-bottom: 20px;
+    padding: 10px 14px;
+    background: rgba(28, 191, 97, 0.1);
+    border: 1px solid rgba(28, 191, 97, 0.3);
+    border-radius: 10px;
+    color: var(--brand-light);
+    font-size: 13px;
+    text-align: center;
+  }
+  .info-msg.show { display: block; }
+
+  /* 页脚 */
+  .footer {
+    margin-top: 28px;
+    text-align: center;
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+
+  /* 响应式 */
+  @media (max-width: 480px) {
+    .card { padding: 36px 24px 28px; border-radius: 18px; }
+    .brand { margin-bottom: 24px; }
+    .logo { width: 56px; height: 56px; }
+    .brand h1 { font-size: 20px; }
+  }
+</style>
+</head>
+<body>
+  <div class="bg"></div>
+  <div class="grid-overlay"></div>
+  <div class="orb orb-1"></div>
+  <div class="orb orb-2"></div>
+
+  <div class="stage">
+    <div class="card">
+      <div class="brand">
+        <div class="logo">
+          <!-- 微信 logo -->
+          <svg viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+            <path d="M664.250054 368.541681c10.015098 0 19.892049 0.732687 29.67346 1.795902-26.647517-122.810047-159.358359-214.077703-310.826188-214.077703-169.353083 0-308.92888 113.851819-308.92888 258.516902 0 83.519758 46.598686 152.248294 124.392425 205.364671l-31.106038 92.821275 108.718805-53.830795c38.937502 7.530687 70.183258 15.291843 109.088946 15.291843 9.772948 0 19.499732-0.477683 29.170339-1.23893-6.075039-20.776198-9.611392-42.509331-9.611392-65.178706C404.831531 466.778224 517.872096 368.541681 664.250054 368.541681zM508.640855 265.587105c20.475137 0 34.059708 13.236709 34.059708 33.424805 0 20.063925-13.584571 33.586447-34.059708 33.586447-20.350297 0-40.769337-13.521499-40.769337-33.586447C467.872541 278.823813 488.291581 265.587105 508.640855 265.587105zM285.864064 332.598357c-20.348251 0-40.830598-13.521499-40.830598-33.586447 0-20.188096 20.482347-33.424805 40.830598-33.424805 20.350297 0 33.958684 13.236709 33.958684 33.424805C319.822748 319.076858 306.214361 332.598357 285.864064 332.598357zM949.439658 603.201476c0-121.260823-121.313525-220.087923-257.360164-220.087923-144.324671 0-257.933526 98.8271-257.933526 220.087923 0 121.392572 113.608855 220.145024 257.933526 220.145024 30.185094 0 60.643629-7.503061 91.021487-15.183612l83.141845 45.265727-22.769887-75.472442C905.923572 733.278481 949.439658 672.43071 949.439658 603.201476zM601.735797 569.823957c-13.521499 0-27.186306-13.304476-27.186306-26.96826 0-13.447443 13.664807-26.873323 27.186306-26.873323 20.5049 0 33.900087 13.425879 33.900087 26.873323C635.635884 556.519481 622.240697 569.823957 601.735797 569.823957zM780.741662 569.823957c-13.427926 0-26.995109-13.304476-26.995109-26.96826 0-13.447443 13.567183-26.873323 26.995109-26.873323 20.348251 0 33.89804 13.425879 33.89804 26.873323C814.639702 556.519481 801.089913 569.823957 780.741662 569.823957z"/>
+          </svg>
+        </div>
+        <h1>docker_web_wechat</h1>
+        <p>Web 微信 · 请登录后使用</p>
+      </div>
+
+      <div id="infoMsg" class="info-msg">已安全退出，请重新登录</div>
+
+      <form id="loginForm" autocomplete="off" novalidate>
+        <div class="field">
+          <label for="username">账号</label>
+          <div class="input-wrap">
+            <svg class="field-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2" stroke-linecap="round" stroke-linejoin="round"/>
+              <circle cx="12" cy="7" r="4" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            <input type="text" id="username" name="username" placeholder="请输入账号" autocomplete="username" required>
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="password">密码</label>
+          <div class="input-wrap">
+            <svg class="field-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="3" y="11" width="18" height="11" rx="2" ry="2" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="M7 11V7a5 5 0 0110 0v4" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            <input type="password" id="password" name="password" placeholder="请输入密码" autocomplete="current-password" required>
+            <button type="button" class="toggle-pw" id="togglePw" aria-label="显示密码">
+              <svg id="eyeIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" stroke-linecap="round" stroke-linejoin="round"/>
+                <circle cx="12" cy="12" r="3" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        <div id="errorMsg" class="error-msg">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="10" stroke-linecap="round" stroke-linejoin="round"/>
+            <line x1="12" y1="8" x2="12" y2="12" stroke-linecap="round" stroke-linejoin="round"/>
+            <line x1="12" y1="16" x2="12.01" y2="16" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <span id="errorText">账号或密码错误</span>
+        </div>
+
+        <button type="submit" class="btn-submit" id="submitBtn">
+          <span id="btnText">登 录</span>
+        </button>
+      </form>
+
+      <div class="footer">
+        © <a href="https://github.com/LimeFinance-org/docker_web_wechat" target="_blank" rel="noopener" style="color: var(--brand-light); text-decoration: none; border-bottom: 1px dotted var(--brand-light);">docker_web_wechat</a> · 安全连接已建立
+      </div>
+    </div>
+  </div>
+
+<script>
+(function() {
+  var form = document.getElementById('loginForm');
+  var errorMsg = document.getElementById('errorMsg');
+  var errorText = document.getElementById('errorText');
+  var infoMsg = document.getElementById('infoMsg');
+  var submitBtn = document.getElementById('submitBtn');
+  var btnText = document.getElementById('btnText');
+  var togglePw = document.getElementById('togglePw');
+  var passwordInput = document.getElementById('password');
+
+  // 登出后提示
+  var params = new URLSearchParams(window.location.search);
+  if (params.get('loggedout') === '1') {
+    infoMsg.classList.add('show');
+  }
+  // 记录原始 next 参数
+  var nextUrl = params.get('next') || '/';
+
+  // 密码可见切换
+  togglePw.addEventListener('click', function() {
+    if (passwordInput.type === 'password') {
+      passwordInput.type = 'text';
+    } else {
+      passwordInput.type = 'password';
+    }
+  });
+
+  function showError(msg) {
+    errorText.textContent = msg || '账号或密码错误';
+    errorMsg.classList.remove('show');
+    void errorMsg.offsetWidth; // 触发重绘以重启动画
+    errorMsg.classList.add('show');
+  }
+
+  function setLoading(loading) {
+    if (loading) {
+      submitBtn.disabled = true;
+      btnText.innerHTML = '<span class="spinner"></span>';
+    } else {
+      submitBtn.disabled = false;
+      btnText.textContent = '登 录';
+    }
+  }
+
+  form.addEventListener('submit', function(e) {
+    e.preventDefault();
+    var username = document.getElementById('username').value.trim();
+    var password = passwordInput.value;
+
+    if (!username || !password) {
+      showError('请输入账号和密码');
+      return;
+    }
+
+    errorMsg.classList.remove('show');
+    setLoading(true);
+
+    var body = new URLSearchParams();
+    body.append('username', username);
+    body.append('password', password);
+    body.append('next', nextUrl);
+
+    fetch('/_auth', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+      credentials: 'same-origin'
+    }).then(function(res) {
+      return res.json().then(function(data) {
+        if (res.ok && data.ok) {
+          // 登录成功，跳转到目标页
+          window.location.href = data.next || '/';
+        } else {
+          showError(data.error || '账号或密码错误');
+          setLoading(false);
+        }
+      });
+    }).catch(function() {
+      showError('网络错误，请重试');
+      setLoading(false);
+    });
+  });
+
+  // 回车提交
+  document.getElementById('username').addEventListener('keypress', function(e) {
+    if (e.key === 'Enter') passwordInput.focus();
+  });
+})();
+</script>
+</body>
+</html>

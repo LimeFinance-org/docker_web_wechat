@@ -1,0 +1,61 @@
+# xwechat-xpra：基于 Xpra 的 Web 微信方案
+# 优势：清晰显示 + 图片剪贴板 + 文件传输 + 纯 Web 访问 + 用户名密码认证 + 自动消息通知
+# 用户端零安装：只需浏览器访问，通知脚本由 Nginx 自动注入到页面
+services:
+  xwechat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: xwechat-xpra:latest
+    container_name: xwechat
+    hostname: xwechat
+    restart: unless-stopped
+
+    # 仅绑定本机回环，建议前面套外部 Nginx/Caddy 做 HTTPS 反向代理
+    # 若需直接公网访问，改为 "0.0.0.0:1989:1989"（已启用 Basic Auth）
+    ports:
+      - "0.0.0.0:1989:1989"   # Web 入口（Basic Auth 认证）
+
+    volumes:
+      # 微信配置（账号登录态、设置等）
+      - ./data/.xwechat:/root/.xwechat
+      # 微信文件（聊天文件、图片、视频缓存等）
+      - ./data/xwechat_files:/root/xwechat_files
+      # 文件传输中转目录（浏览器上传的文件会落在这里）
+      - ./data/downloads:/root/downloads
+      # 可选：自定义字体渲染配置
+      # - ./fontconfig/local.conf:/etc/fonts/local.conf:ro
+
+    environment:
+      - LANG=zh_CN.UTF-8
+      - TZ=Asia/Shanghai
+      - USER_ID=0
+      - GROUP_ID=0
+
+      # ===== 显示清晰度相关 =====
+      - XPRA_DPI=144                  # DPI：96 普通 / 144 高清 / 192 4K
+      - XPRA_WIDTH=1920               # 初始分辨率（Xpra 会自动适配浏览器窗口）
+      - XPRA_HEIGHT=1080
+      - XPRA_ENCODING=vp9             # 编码：jpeg/png/webp/h264/vp8/vp9
+                                      #   vp9  - 画质最好，CPU 占用较高
+                                      #   h264 - 兼容性最好，画质好
+                                      #   png  - 静态画面最清晰，不适合动态
+      - XPRA_VIDEO_ENCODING=yes       # 启用视频编码（推荐 yes）
+      - XPRA_QUALITY=100              # 编码质量 0-100，越高越清晰
+      - XPRA_COMPRESSION=0            # 压缩级别 0-9，越低画质越好
+
+      # ===== Web 访问认证（用户名+密码）=====
+      # 默认：baby / caijing...
+      # 修改后重启容器生效
+      - WEB_AUTH_USER=baby
+      - WEB_AUTH_PASSWORD=caijing...
+
+      # ===== 内部端口（仅容器内，无需修改）=====
+      # Xpra HTML5 客户端
+      - XPRA_PORT=8080
+      # 通知守护进程
+      - NOTIFY_PORT=19892
+      - NOTIFY_HOST=0.0.0.0
+
+      # ===== 音频 =====
+      # 浏览器可听到微信消息提示音（自动走 Web Audio API）
