@@ -290,16 +290,16 @@
 
 // ============== IME 输入法支持 ==============
 // 根本原因：
-//   1. Xpra HTML5 客户端在 document 冒泡阶段绑定 keydown 监听，并调用 e.preventDefault()
-//      这会立即终止浏览器 IME 组合会话（MDN: preventDefault on keydown commits composition）
-//   2. Xpra 渲染区域是 canvas，不是可编辑元素，浏览器 IME 没有目标元素可组合文本
-//   3. 没有 editable DOM 元素时，compositionend 的 e.data 可能为空
+//   Xpra HTML5 客户端自带 #pasteboard textarea 并始终保持聚焦（enable_clipboard_autofocus）。
+//   Xpra 的 document 冒泡阶段 keydown 监听器调用 e.preventDefault()，这会立即终止
+//   浏览器 IME 组合会话。IME 需要可编辑元素来组合文本，#pasteboard 正好满足。
 //
-// 解决方案（三层）：
-//   1. 创建隐藏 <textarea> 作为 IME 的文本组合目标（浏览器 IME 必备）
-//   2. 捕获阶段用 stopImmediatePropagation 阻止事件到达 Xpra 冒泡阶段监听器
-//      （不调用 preventDefault，让浏览器正常处理 IME）
-//   3. compositionend 时读取 textarea 的值 → HTTP POST /_type-text → xdotool type
+// 方案（直接复用 Xpra 的 pasteboard）：
+//   1. 在 #pasteboard 上添加捕获阶段 keydown 监听
+//      - IME 组合中 → stopPropagation()，阻止冒泡到 Xpra 的 document 监听器
+//      - 非 IME → 不干预，Xpra 正常处理
+//   2. 监听 #pasteboard 上的 compositionstart / compositionend
+//   3. compositionend → POST /_type-text → xdotool type 输入到微信
 (function () {
     'use strict';
     if (window.__imeHelperLoaded) return;
@@ -307,127 +307,78 @@
 
     var isComposing = false;
     var typeLock = false;
+    var savedPasteboardValue = '';
 
-    // ── 1. 创建隐藏 textarea，作为浏览器 IME 的文本组合目标 ──
-    var imeInput = document.createElement('textarea');
-    imeInput.setAttribute('autocomplete', 'off');
-    imeInput.setAttribute('autocorrect', 'off');
-    imeInput.setAttribute('autocapitalize', 'off');
-    imeInput.setAttribute('spellcheck', 'false');
-    imeInput.style.cssText =
-        'position:fixed;top:0;left:0;width:1px;height:1px;' +
-        'opacity:0;pointer-events:none;z-index:-1;resize:none;' +
-        'border:none;outline:none;padding:0;margin:0;';
-    document.body.appendChild(imeInput);
-
-    // 始终尝试保持 textarea 聚焦（浏览器 IME 需要聚焦的 editable 元素）
-    function ensureFocus() {
-        if (document.activeElement !== imeInput) {
-            imeInput.focus();
+    // 等待 Xpra 创建 pasteboard 后初始化
+    function initWhenReady() {
+        var pb = document.getElementById('pasteboard');
+        if (!pb) {
+            setTimeout(initWhenReady, 200);
+            return;
         }
+
+        // 确保 pasteboard 不是 readonly（浏览器 IME 不能在 readonly 元素上组合）
+        if (pb.readOnly) {
+            pb.readOnly = false;
+            console.log('[ime] pasteboard readonly 已取消');
+        }
+
+        // ── 捕获阶段 keydown：IME 中阻止冒泡，非 IME 不干预 ──
+        pb.addEventListener('keydown', function (e) {
+            if (isComposing || e.isComposing || e.keyCode === 229) {
+                // IME 组合中：阻止冒泡到 document（阻止 Xpra 的 preventDefault 杀死 IME）
+                e.stopPropagation();
+                // 不调用 preventDefault — 让浏览器 IME 正常处理
+            }
+            // 非 IME：不做任何处理，事件正常冒泡到 document → Xpra 处理
+        }, true);
+
+        // ── IME 组合事件 ──
+        pb.addEventListener('compositionstart', function () {
+            isComposing = true;
+            savedPasteboardValue = pb.value || '';
+            console.log('[ime] 组合开始');
+        });
+
+        pb.addEventListener('compositionupdate', function (e) {
+            console.log('[ime] 组合中:', e.data);
+        });
+
+        pb.addEventListener('compositionend', function (e) {
+            isComposing = false;
+            var text = e.data || '';
+            if (!text || typeLock) {
+                console.log('[ime] 组合结束，无文本');
+                return;
+            }
+
+            console.log('[ime] 组合完成:', text);
+
+            // 恢复 pasteboard 原始值
+            pb.value = savedPasteboardValue;
+
+            typeLock = true;
+            fetch('/_type-text', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text: text }),
+                credentials: 'same-origin'
+            }).then(function (resp) { return resp.json(); })
+              .then(function (data) {
+                  if (data.ok) {
+                      console.log('[ime] 已输入:', text);
+                  } else {
+                      console.error('[ime] 输入失败:', data.error);
+                  }
+              }).catch(function (err) {
+                  console.error('[ime] 请求异常:', err);
+              }).finally(function () {
+                  setTimeout(function () { typeLock = false; }, 100);
+              });
+        });
+
+        console.log('[ime] IME 支持已就绪（复用 Xpra pasteboard）');
     }
-    ensureFocus();
-    // 页面点击时重新聚焦
-    document.addEventListener('click', function () {
-        setTimeout(ensureFocus, 50);
-    });
-    // 失焦时重新聚焦（仅在页面处于前台时，避免抢走地址栏等浏览器 UI 的焦点）
-    imeInput.addEventListener('blur', function () {
-        if (!isComposing && document.hasFocus()) {
-            setTimeout(ensureFocus, 100);
-        }
-    });
 
-    // 非 IME 按键：转发到 document 给 Xpra 处理
-    // IME 组合时：允许事件在 textarea 上自然处理（不做 preventDefault）
-    imeInput.addEventListener('keydown', function (e) {
-        e.stopPropagation(); // 始终阻止冒泡到 document（我们手动转发）
-
-        if (isComposing) {
-            // IME 组合中：不 preventDefault，让浏览器自然组合文字到 textarea
-            return;
-        }
-
-        e.preventDefault();  // 非 IME：阻止字符写入 textarea
-
-        // 构造克隆事件派发给 Xpra
-        var cloned = new KeyboardEvent('keydown', {
-            key: e.key, code: e.code, keyCode: e.keyCode, which: e.which,
-            ctrlKey: e.ctrlKey, shiftKey: e.shiftKey, altKey: e.altKey,
-            metaKey: e.metaKey, repeat: e.repeat,
-            location: e.location, composed: true, bubbles: true
-        });
-        cloned.getModifierState = function (mod) { return e.getModifierState(mod); };
-        document.dispatchEvent(cloned);
-    }, true);
-
-    imeInput.addEventListener('keyup', function (e) {
-        e.stopPropagation();
-        if (isComposing) return;
-
-        e.preventDefault();
-        var cloned = new KeyboardEvent('keyup', {
-            key: e.key, code: e.code, keyCode: e.keyCode, which: e.which,
-            ctrlKey: e.ctrlKey, shiftKey: e.shiftKey, altKey: e.altKey,
-            metaKey: e.metaKey, repeat: e.repeat,
-            location: e.location, composed: true, bubbles: true
-        });
-        cloned.getModifierState = function (mod) { return e.getModifierState(mod); };
-        document.dispatchEvent(cloned);
-    }, true);
-
-    // ── 2. IME 组合事件 ──
-    imeInput.addEventListener('compositionstart', function () {
-        isComposing = true;
-        imeInput.value = ''; // 清空上次残留
-        console.log('[ime] 组合开始');
-    });
-
-    imeInput.addEventListener('compositionupdate', function (e) {
-        console.log('[ime] 组合中:', e.data);
-    });
-
-    imeInput.addEventListener('compositionend', function (e) {
-        isComposing = false;
-        // 优先用 textarea 的实际值（更可靠），fallback 到 e.data
-        var text = imeInput.value || e.data || '';
-        imeInput.value = '';
-
-        if (!text || typeLock) {
-            console.log('[ime] 组合结束，无文本');
-            return;
-        }
-
-        console.log('[ime] 组合完成:', text);
-
-        typeLock = true;
-        fetch('/_type-text', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text: text }),
-            credentials: 'same-origin'
-        }).then(function (resp) { return resp.json(); })
-          .then(function (data) {
-              if (data.ok) {
-                  console.log('[ime] 已输入:', text);
-              } else {
-                  console.error('[ime] 输入失败:', data.error);
-              }
-          }).catch(function (err) {
-              console.error('[ime] 请求异常:', err);
-          }).finally(function () {
-              setTimeout(function () { typeLock = false; }, 100);
-          });
-    });
-
-    // 确保 textarea 不被 Xpra 的 keydown preventDefault 杀掉 IME：
-    // 在 document 捕获阶段，如果是 IME 按键且目标不是 textarea，阻止传播
-    document.addEventListener('keydown', function (e) {
-        if (e.target !== imeInput && (e.isComposing || e.keyCode === 229)) {
-            e.stopImmediatePropagation();
-            // 不调用 preventDefault，让浏览器正常处理 IME
-        }
-    }, true);
-
-    console.log('[ime] IME 支持已加载（textarea + xdotool type）');
+    initWhenReady();
 })();
