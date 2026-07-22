@@ -29,7 +29,14 @@
     // ============== 状态 ==============
     let lastUnread = 0;
     let lastNotifyTs = 0;
-    let originalTitle = document.title;
+    let originalTitle = 'web_wechat';
+    document.title = originalTitle;
+    // 强制标题为 web_wechat（防止 Xpra 动态修改标题）
+    setInterval(function () {
+        if (!flashTimer && document.title !== originalTitle) {
+            document.title = originalTitle;
+        }
+    }, 3000);
     let flashTimer = null;
     let isActiveWindow = true;
 
