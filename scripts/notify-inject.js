@@ -211,6 +211,16 @@
         });
     }
 
+    // 模拟 Ctrl+V 按键（使用 Xpra 正确的 key-action 包格式）
+    // 包格式: ["key-action", wid, keyname, pressed, modifiers, keycode, keystring, keycode, 0]
+    function simulateCtrlV(client) {
+        var wid = client.focused_wid || 0;
+        client.send(["key-action", wid, "Control_L", true, [], 17, "", 17, 0]);
+        client.send(["key-action", wid, "v", true, ["control"], 86, "v", 86, 0]);
+        client.send(["key-action", wid, "v", false, ["control"], 86, "v", 86, 0]);
+        client.send(["key-action", wid, "Control_L", false, [], 17, "", 17, 0]);
+    }
+
     function sendImageToClipboard(uint8data, mimeType) {
         var client = getClient();
         if (!client) { console.warn('[paste] Xpra client 未就绪'); return; }
@@ -222,10 +232,7 @@
             // 延迟模拟 Ctrl+V
             setTimeout(function () {
                 try {
-                    client.send(['key-action', 0, 'Control_L', true, 1, ['control'], 0, '']);
-                    client.send(['key-action', 0, 'v', true, 1, ['control'], 0, '']);
-                    client.send(['key-action', 0, 'v', false, 1, ['control'], 0, '']);
-                    client.send(['key-action', 0, 'Control_L', false, 1, [], 0, '']);
+                    simulateCtrlV(client);
                     console.log('[paste] 已模拟 Ctrl+V');
                 } catch (e) { console.error('[paste] Ctrl+V 失败:', e); }
             }, 200);
@@ -290,14 +297,25 @@
 //   1. 用户使用浏览器自带的输入法打字（如拼音、五笔等）
 //   2. Xpra 客户端正确跳过 keyCode=229 的 keydown（不干扰输入法组合）
 //   3. compositionend 触发时，获取组合完成的文本
-//   4. 将文本写入 Xpra 剪贴板 + 浏览器剪贴板
-//   5. 模拟 Ctrl+V 将文本粘贴到微信输入框
+//   4. 保存用户当前剪贴板内容
+//   5. 将文本写入 Xpra 剪贴板 + 浏览器剪贴板
+//   6. 模拟 Ctrl+V 将文本粘贴到微信输入框
+//   7. 粘贴完成后恢复用户原始剪贴板内容
 (function () {
     'use strict';
     if (window.__imeHelperLoaded) return;
     window.__imeHelperLoaded = true;
 
     var pasteLock = false;
+
+    // 模拟 Ctrl+V（使用正确的 key-action 包格式）
+    function simulateCtrlV(client) {
+        var wid = client.focused_wid || 0;
+        client.send(["key-action", wid, "Control_L", true, [], 17, "", 17, 0]);
+        client.send(["key-action", wid, "v", true, ["control"], 86, "v", 86, 0]);
+        client.send(["key-action", wid, "v", false, ["control"], 86, "v", 86, 0]);
+        client.send(["key-action", wid, "Control_L", false, [], 17, "", 17, 0]);
+    }
 
     document.addEventListener('compositionend', function (e) {
         var text = e.data;
@@ -309,38 +327,61 @@
         pasteLock = true;
         console.log('[ime] 输入法完成:', text);
 
-        // 将文本转为 Uint8Array（UTF-8 编码）
-        var encoder = new TextEncoder();
-        var textBytes = encoder.encode(text);
+        // 保存当前剪贴板状态（粘贴后恢复）
+        var savedBuffer = client.clipboard_buffer;
+        var savedDatatype = client.clipboard_datatype;
 
-        // 1. 设置 Xpra 剪贴板 buffer（服务器请求剪贴板内容时返回此值）
-        client.clipboard_buffer = text;
-        client.clipboard_datatype = 'UTF8_STRING';
+        function doPaste() {
+            var encoder = new TextEncoder();
+            var textBytes = encoder.encode(text);
 
-        // 2. 通知服务器剪贴板已更新
-        client.send_clipboard_token(textBytes, ['UTF8_STRING', 'text/plain']);
+            // 1. 设置 Xpra 剪贴板 buffer
+            client.clipboard_buffer = text;
+            client.clipboard_datatype = 'UTF8_STRING';
 
-        // 3. 同步写入浏览器剪贴板（Xpra 客户端会优先读取 navigator.clipboard）
-        if (navigator.clipboard && navigator.clipboard.writeText) {
-            navigator.clipboard.writeText(text).catch(function (err) {
-                console.warn('[ime] 同步浏览器剪贴板失败:', err);
-            });
+            // 2. 通知服务器剪贴板已更新
+            client.send_clipboard_token(textBytes, ['UTF8_STRING', 'text/plain']);
+
+            // 3. 同步写入浏览器剪贴板（Xpra 客户端请求剪贴板时会优先读取 navigator.clipboard）
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(text).catch(function (err) {
+                    console.warn('[ime] 同步浏览器剪贴板失败:', err);
+                });
+            }
+
+            // 4. 延迟模拟 Ctrl+V 粘贴到微信输入框
+            setTimeout(function () {
+                try {
+                    simulateCtrlV(client);
+                    console.log('[ime] 已粘贴中文输入');
+                } catch (err) {
+                    console.error('[ime] 粘贴失败:', err);
+                }
+
+                // 5. 恢复原始剪贴板内容（避免覆盖用户剪贴板）
+                setTimeout(function () {
+                    client.clipboard_buffer = savedBuffer;
+                    client.clipboard_datatype = savedDatatype;
+                    // 恢复浏览器剪贴板
+                    if (savedBrowserClip !== null && navigator.clipboard && navigator.clipboard.writeText) {
+                        navigator.clipboard.writeText(savedBrowserClip).catch(function () {});
+                    }
+                    pasteLock = false;
+                }, 300);
+            }, 200);
         }
 
-        // 4. 延迟模拟 Ctrl+V 粘贴到微信输入框
-        setTimeout(function () {
-            try {
-                client.send(['key-action', 0, 'Control_L', true, 1, ['control'], 0, '']);
-                client.send(['key-action', 0, 'v', true, 1, ['control'], 0, '']);
-                client.send(['key-action', 0, 'v', false, 1, ['control'], 0, '']);
-                client.send(['key-action', 0, 'Control_L', false, 1, [], 0, '']);
-                console.log('[ime] 已粘贴中文输入');
-            } catch (err) {
-                console.error('[ime] 粘贴失败:', err);
-            }
-            // 释放锁，允许下一次输入
-            setTimeout(function () { pasteLock = false; }, 200);
-        }, 200);
+        // 尝试保存浏览器剪贴板内容（用于粘贴后恢复）
+        var savedBrowserClip = null;
+        if (navigator.clipboard && navigator.clipboard.readText) {
+            navigator.clipboard.readText().then(function (saved) {
+                savedBrowserClip = saved;
+            }).catch(function () {}).finally(function () {
+                doPaste();
+            });
+        } else {
+            doPaste();
+        }
     });
 
     console.log('[ime] IME 输入法支持已加载');
