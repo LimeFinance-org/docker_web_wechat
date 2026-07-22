@@ -289,16 +289,17 @@
 })();
 
 // ============== IME 输入法支持 ==============
-// 问题：Xpra HTML5 客户端的 _keyb_process 只检查 keyCode===229 来跳过 IME 组合事件，
-//       但现代浏览器（Chrome）可能不设置 keyCode=229，而是用 event.isComposing=true。
-//       这导致输入法组合期间的英文按键被发送到 Xpra 服务器，微信对话框显示英文。
+// 根本原因：
+//   1. Xpra HTML5 客户端在 document 冒泡阶段绑定 keydown 监听，并调用 e.preventDefault()
+//      这会立即终止浏览器 IME 组合会话（MDN: preventDefault on keydown commits composition）
+//   2. Xpra 渲染区域是 canvas，不是可编辑元素，浏览器 IME 没有目标元素可组合文本
+//   3. 没有 editable DOM 元素时，compositionend 的 e.data 可能为空
 //
-// 解决方案：
-//   1. 拦截 keydown/keyup 事件，在 IME 组合期间（isComposing 或 keyCode===229）
-//      阻止事件传播到 Xpra 客户端
-//   2. 监听 compositionend，将组合完成的中文文本通过 HTTP POST 发送到 /_type-text
-//   3. 服务器端用 xdotool type 将文本直接输入到微信对话框
-//   这种方式不依赖剪贴板，不会覆盖用户剪贴板内容
+// 解决方案（三层）：
+//   1. 创建隐藏 <textarea> 作为 IME 的文本组合目标（浏览器 IME 必备）
+//   2. 捕获阶段用 stopImmediatePropagation 阻止事件到达 Xpra 冒泡阶段监听器
+//      （不调用 preventDefault，让浏览器正常处理 IME）
+//   3. compositionend 时读取 textarea 的值 → HTTP POST /_type-text → xdotool type
 (function () {
     'use strict';
     if (window.__imeHelperLoaded) return;
@@ -307,83 +308,126 @@
     var isComposing = false;
     var typeLock = false;
 
-    // 在捕获阶段拦截 keydown/keyup，阻止 IME 组合期间的按键到达 Xpra 客户端
-    document.addEventListener('keydown', function (e) {
-        if (e.isComposing || e.keyCode === 229) {
-            e.stopPropagation();
-            e.preventDefault();
+    // ── 1. 创建隐藏 textarea，作为浏览器 IME 的文本组合目标 ──
+    var imeInput = document.createElement('textarea');
+    imeInput.setAttribute('autocomplete', 'off');
+    imeInput.setAttribute('autocorrect', 'off');
+    imeInput.setAttribute('autocapitalize', 'off');
+    imeInput.setAttribute('spellcheck', 'false');
+    imeInput.style.cssText =
+        'position:fixed;top:0;left:0;width:1px;height:1px;' +
+        'opacity:0;pointer-events:none;z-index:-1;resize:none;' +
+        'border:none;outline:none;padding:0;margin:0;';
+    document.body.appendChild(imeInput);
+
+    // 始终尝试保持 textarea 聚焦（浏览器 IME 需要聚焦的 editable 元素）
+    function ensureFocus() {
+        if (document.activeElement !== imeInput) {
+            imeInput.focus();
         }
-    }, true);
-
-    document.addEventListener('keyup', function (e) {
-        if (e.isComposing || e.keyCode === 229) {
-            e.stopPropagation();
-            e.preventDefault();
-        }
-    }, true);
-
-    // 覆盖 Xpra 客户端的 _keyb_process，增加 isComposing 检查
-    function patchXpraKeyboard() {
-        var client = window.client;
-        if (!client || !client._keyb_process || client.__imePatched) return false;
-
-        var original = client._keyb_process;
-        client._keyb_process = function (pressed, event) {
-            // IME 组合中或 keyCode=229 时跳过，不发送按键到服务器
-            if (isComposing || (event && (event.isComposing || event.keyCode === 229))) {
-                return true; // 返回 true 表示已处理，阻止 preventDefault
-            }
-            return original.call(this, pressed, event);
-        };
-        client.__imePatched = true;
-        console.log('[ime] 已覆盖 Xpra _keyb_process');
-        return true;
     }
-
-    document.addEventListener('compositionstart', function () {
-        isComposing = true;
-        console.log('[ime] 输入法组合开始');
+    ensureFocus();
+    // 页面点击时重新聚焦
+    document.addEventListener('click', function () {
+        setTimeout(ensureFocus, 50);
+    });
+    // 失焦时重新聚焦（仅在页面处于前台时，避免抢走地址栏等浏览器 UI 的焦点）
+    imeInput.addEventListener('blur', function () {
+        if (!isComposing && document.hasFocus()) {
+            setTimeout(ensureFocus, 100);
+        }
     });
 
-    document.addEventListener('compositionend', function (e) {
+    // 非 IME 按键：转发到 document 给 Xpra 处理
+    // IME 组合时：允许事件在 textarea 上自然处理（不做 preventDefault）
+    imeInput.addEventListener('keydown', function (e) {
+        e.stopPropagation(); // 始终阻止冒泡到 document（我们手动转发）
+
+        if (isComposing) {
+            // IME 组合中：不 preventDefault，让浏览器自然组合文字到 textarea
+            return;
+        }
+
+        e.preventDefault();  // 非 IME：阻止字符写入 textarea
+
+        // 构造克隆事件派发给 Xpra
+        var cloned = new KeyboardEvent('keydown', {
+            key: e.key, code: e.code, keyCode: e.keyCode, which: e.which,
+            ctrlKey: e.ctrlKey, shiftKey: e.shiftKey, altKey: e.altKey,
+            metaKey: e.metaKey, repeat: e.repeat,
+            location: e.location, composed: true, bubbles: true
+        });
+        cloned.getModifierState = function (mod) { return e.getModifierState(mod); };
+        document.dispatchEvent(cloned);
+    }, true);
+
+    imeInput.addEventListener('keyup', function (e) {
+        e.stopPropagation();
+        if (isComposing) return;
+
+        e.preventDefault();
+        var cloned = new KeyboardEvent('keyup', {
+            key: e.key, code: e.code, keyCode: e.keyCode, which: e.which,
+            ctrlKey: e.ctrlKey, shiftKey: e.shiftKey, altKey: e.altKey,
+            metaKey: e.metaKey, repeat: e.repeat,
+            location: e.location, composed: true, bubbles: true
+        });
+        cloned.getModifierState = function (mod) { return e.getModifierState(mod); };
+        document.dispatchEvent(cloned);
+    }, true);
+
+    // ── 2. IME 组合事件 ──
+    imeInput.addEventListener('compositionstart', function () {
+        isComposing = true;
+        imeInput.value = ''; // 清空上次残留
+        console.log('[ime] 组合开始');
+    });
+
+    imeInput.addEventListener('compositionupdate', function (e) {
+        console.log('[ime] 组合中:', e.data);
+    });
+
+    imeInput.addEventListener('compositionend', function (e) {
         isComposing = false;
-        var text = e.data;
-        if (!text || typeLock) return;
-        console.log('[ime] 输入法完成:', text);
+        // 优先用 textarea 的实际值（更可靠），fallback 到 e.data
+        var text = imeInput.value || e.data || '';
+        imeInput.value = '';
+
+        if (!text || typeLock) {
+            console.log('[ime] 组合结束，无文本');
+            return;
+        }
+
+        console.log('[ime] 组合完成:', text);
 
         typeLock = true;
-        // 通过 HTTP POST 发送文本到服务器，服务器用 xdotool type 输入
         fetch('/_type-text', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ text: text }),
             credentials: 'same-origin'
-        }).then(function (resp) {
-            return resp.json();
-        }).then(function (data) {
-            if (data.ok) {
-                console.log('[ime] 文本已输入:', data.length, '字符');
-            } else {
-                console.error('[ime] 输入失败:', data.error);
-            }
-        }).catch(function (err) {
-            console.error('[ime] 请求异常:', err);
-        }).finally(function () {
-            setTimeout(function () { typeLock = false; }, 100);
-        });
+        }).then(function (resp) { return resp.json(); })
+          .then(function (data) {
+              if (data.ok) {
+                  console.log('[ime] 已输入:', text);
+              } else {
+                  console.error('[ime] 输入失败:', data.error);
+              }
+          }).catch(function (err) {
+              console.error('[ime] 请求异常:', err);
+          }).finally(function () {
+              setTimeout(function () { typeLock = false; }, 100);
+          });
     });
 
-    // 等待 Xpra client 就绪后覆盖键盘处理
-    var patchTimer = setInterval(function () {
-        if (window.client && window.client.connected) {
-            if (patchXpraKeyboard()) {
-                clearInterval(patchTimer);
-            }
+    // 确保 textarea 不被 Xpra 的 keydown preventDefault 杀掉 IME：
+    // 在 document 捕获阶段，如果是 IME 按键且目标不是 textarea，阻止传播
+    document.addEventListener('keydown', function (e) {
+        if (e.target !== imeInput && (e.isComposing || e.keyCode === 229)) {
+            e.stopImmediatePropagation();
+            // 不调用 preventDefault，让浏览器正常处理 IME
         }
-    }, 500);
+    }, true);
 
-    // 10 秒后停止尝试
-    setTimeout(function () { clearInterval(patchTimer); }, 10000);
-
-    console.log('[ime] IME 输入法支持已加载（xdotool type 模式）');
+    console.log('[ime] IME 支持已加载（textarea + xdotool type）');
 })();
