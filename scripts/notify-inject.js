@@ -280,3 +280,68 @@
 
     console.log('[paste] 粘贴助手已就绪');
 })();
+
+// ============== IME 输入法支持 ==============
+// Xpra HTML5 客户端不处理 compositionend 事件，导致浏览器输入法（中文/日文/韩文等）
+// 组合的文本无法发送到 Xpra 服务器。本段代码监听 compositionend，通过剪贴板 + Ctrl+V
+// 将输入法组合的文本粘贴到微信对话框。
+//
+// 原理：
+//   1. 用户使用浏览器自带的输入法打字（如拼音、五笔等）
+//   2. Xpra 客户端正确跳过 keyCode=229 的 keydown（不干扰输入法组合）
+//   3. compositionend 触发时，获取组合完成的文本
+//   4. 将文本写入 Xpra 剪贴板 + 浏览器剪贴板
+//   5. 模拟 Ctrl+V 将文本粘贴到微信输入框
+(function () {
+    'use strict';
+    if (window.__imeHelperLoaded) return;
+    window.__imeHelperLoaded = true;
+
+    var pasteLock = false;
+
+    document.addEventListener('compositionend', function (e) {
+        var text = e.data;
+        if (!text || pasteLock) return;
+
+        var client = window.client;
+        if (!client || !client.connected) return;
+
+        pasteLock = true;
+        console.log('[ime] 输入法完成:', text);
+
+        // 将文本转为 Uint8Array（UTF-8 编码）
+        var encoder = new TextEncoder();
+        var textBytes = encoder.encode(text);
+
+        // 1. 设置 Xpra 剪贴板 buffer（服务器请求剪贴板内容时返回此值）
+        client.clipboard_buffer = text;
+        client.clipboard_datatype = 'UTF8_STRING';
+
+        // 2. 通知服务器剪贴板已更新
+        client.send_clipboard_token(textBytes, ['UTF8_STRING', 'text/plain']);
+
+        // 3. 同步写入浏览器剪贴板（Xpra 客户端会优先读取 navigator.clipboard）
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).catch(function (err) {
+                console.warn('[ime] 同步浏览器剪贴板失败:', err);
+            });
+        }
+
+        // 4. 延迟模拟 Ctrl+V 粘贴到微信输入框
+        setTimeout(function () {
+            try {
+                client.send(['key-action', 0, 'Control_L', true, 1, ['control'], 0, '']);
+                client.send(['key-action', 0, 'v', true, 1, ['control'], 0, '']);
+                client.send(['key-action', 0, 'v', false, 1, ['control'], 0, '']);
+                client.send(['key-action', 0, 'Control_L', false, 1, [], 0, '']);
+                console.log('[ime] 已粘贴中文输入');
+            } catch (err) {
+                console.error('[ime] 粘贴失败:', err);
+            }
+            // 释放锁，允许下一次输入
+            setTimeout(function () { pasteLock = false; }, 200);
+        }, 200);
+    });
+
+    console.log('[ime] IME 输入法支持已加载');
+})();
