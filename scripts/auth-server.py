@@ -170,8 +170,66 @@ class AuthHandler(http.server.BaseHTTPRequestHandler):
         if self.path == "/_upload-file":
             self._handle_upload_file()
             return
+        # 输入法文本输入（用于 IME 中文输入到微信对话框）
+        if self.path == "/_type-text":
+            self._handle_type_text()
+            return
         self.send_response(HTTPStatus.NOT_FOUND)
         self.end_headers()
+
+    def _handle_type_text(self):
+        """接收输入法组合完成的文本，用 xdotool type 输入到微信对话框"""
+        # 校验登录状态
+        token = parse_cookie(self.headers.get("Cookie", ""))
+        if not (token and verify_token(token)):
+            self._json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "未登录"})
+            return
+
+        # 读取 JSON body
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        if length <= 0 or length > 1024 * 1024:
+            self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "文本长度不合法"})
+            return
+
+        raw = self.rfile.read(length)
+        try:
+            data = json.loads(raw)
+            text = data.get("text", "")
+        except (json.JSONDecodeError, AttributeError):
+            self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "JSON 解析失败"})
+            return
+
+        if not text or not isinstance(text, str):
+            self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "文本为空"})
+            return
+
+        # 安全限制：最多 500 字符
+        if len(text) > 500:
+            text = text[:500]
+
+        try:
+            subprocess.run(
+                ["xdotool", "type", "--clearmodifiers", "--delay", "0", text],
+                capture_output=True,
+                timeout=5,
+                env={**os.environ, "DISPLAY": os.environ.get("DISPLAY", ":100")}
+            )
+            sys.stdout.write(f"[auth-server] xdotool type: {text[:50]}...\n")
+            sys.stdout.flush()
+        except FileNotFoundError:
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": "xdotool 未安装"})
+            return
+        except subprocess.TimeoutExpired:
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": "xdotool 超时"})
+            return
+        except Exception as e:
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(e)})
+            return
+
+        self._json(HTTPStatus.OK, {"ok": True, "length": len(text)})
 
     def _handle_upload_file(self):
         """接收文件上传，保存到临时目录，设置 X11 剪贴板为 text/uri-list"""

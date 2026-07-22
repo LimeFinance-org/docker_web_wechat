@@ -289,100 +289,101 @@
 })();
 
 // ============== IME 输入法支持 ==============
-// Xpra HTML5 客户端不处理 compositionend 事件，导致浏览器输入法（中文/日文/韩文等）
-// 组合的文本无法发送到 Xpra 服务器。本段代码监听 compositionend，通过剪贴板 + Ctrl+V
-// 将输入法组合的文本粘贴到微信对话框。
+// 问题：Xpra HTML5 客户端的 _keyb_process 只检查 keyCode===229 来跳过 IME 组合事件，
+//       但现代浏览器（Chrome）可能不设置 keyCode=229，而是用 event.isComposing=true。
+//       这导致输入法组合期间的英文按键被发送到 Xpra 服务器，微信对话框显示英文。
 //
-// 原理：
-//   1. 用户使用浏览器自带的输入法打字（如拼音、五笔等）
-//   2. Xpra 客户端正确跳过 keyCode=229 的 keydown（不干扰输入法组合）
-//   3. compositionend 触发时，获取组合完成的文本
-//   4. 保存用户当前剪贴板内容
-//   5. 将文本写入 Xpra 剪贴板 + 浏览器剪贴板
-//   6. 模拟 Ctrl+V 将文本粘贴到微信输入框
-//   7. 粘贴完成后恢复用户原始剪贴板内容
+// 解决方案：
+//   1. 拦截 keydown/keyup 事件，在 IME 组合期间（isComposing 或 keyCode===229）
+//      阻止事件传播到 Xpra 客户端
+//   2. 监听 compositionend，将组合完成的中文文本通过 HTTP POST 发送到 /_type-text
+//   3. 服务器端用 xdotool type 将文本直接输入到微信对话框
+//   这种方式不依赖剪贴板，不会覆盖用户剪贴板内容
 (function () {
     'use strict';
     if (window.__imeHelperLoaded) return;
     window.__imeHelperLoaded = true;
 
-    var pasteLock = false;
+    var isComposing = false;
+    var typeLock = false;
 
-    // 模拟 Ctrl+V（使用正确的 key-action 包格式）
-    function simulateCtrlV(client) {
-        var wid = client.focused_wid || 0;
-        client.send(["key-action", wid, "Control_L", true, [], 17, "", 17, 0]);
-        client.send(["key-action", wid, "v", true, ["control"], 86, "v", 86, 0]);
-        client.send(["key-action", wid, "v", false, ["control"], 86, "v", 86, 0]);
-        client.send(["key-action", wid, "Control_L", false, [], 17, "", 17, 0]);
+    // 在捕获阶段拦截 keydown/keyup，阻止 IME 组合期间的按键到达 Xpra 客户端
+    document.addEventListener('keydown', function (e) {
+        if (e.isComposing || e.keyCode === 229) {
+            e.stopPropagation();
+            e.preventDefault();
+        }
+    }, true);
+
+    document.addEventListener('keyup', function (e) {
+        if (e.isComposing || e.keyCode === 229) {
+            e.stopPropagation();
+            e.preventDefault();
+        }
+    }, true);
+
+    // 覆盖 Xpra 客户端的 _keyb_process，增加 isComposing 检查
+    function patchXpraKeyboard() {
+        var client = window.client;
+        if (!client || !client._keyb_process || client.__imePatched) return false;
+
+        var original = client._keyb_process;
+        client._keyb_process = function (pressed, event) {
+            // IME 组合中或 keyCode=229 时跳过，不发送按键到服务器
+            if (isComposing || (event && (event.isComposing || event.keyCode === 229))) {
+                return true; // 返回 true 表示已处理，阻止 preventDefault
+            }
+            return original.call(this, pressed, event);
+        };
+        client.__imePatched = true;
+        console.log('[ime] 已覆盖 Xpra _keyb_process');
+        return true;
     }
 
-    document.addEventListener('compositionend', function (e) {
-        var text = e.data;
-        if (!text || pasteLock) return;
-
-        var client = window.client;
-        if (!client || !client.connected) return;
-
-        pasteLock = true;
-        console.log('[ime] 输入法完成:', text);
-
-        // 保存当前剪贴板状态（粘贴后恢复）
-        var savedBuffer = client.clipboard_buffer;
-        var savedDatatype = client.clipboard_datatype;
-
-        function doPaste() {
-            var encoder = new TextEncoder();
-            var textBytes = encoder.encode(text);
-
-            // 1. 设置 Xpra 剪贴板 buffer
-            client.clipboard_buffer = text;
-            client.clipboard_datatype = 'UTF8_STRING';
-
-            // 2. 通知服务器剪贴板已更新
-            client.send_clipboard_token(textBytes, ['UTF8_STRING', 'text/plain']);
-
-            // 3. 同步写入浏览器剪贴板（Xpra 客户端请求剪贴板时会优先读取 navigator.clipboard）
-            if (navigator.clipboard && navigator.clipboard.writeText) {
-                navigator.clipboard.writeText(text).catch(function (err) {
-                    console.warn('[ime] 同步浏览器剪贴板失败:', err);
-                });
-            }
-
-            // 4. 延迟模拟 Ctrl+V 粘贴到微信输入框
-            setTimeout(function () {
-                try {
-                    simulateCtrlV(client);
-                    console.log('[ime] 已粘贴中文输入');
-                } catch (err) {
-                    console.error('[ime] 粘贴失败:', err);
-                }
-
-                // 5. 恢复原始剪贴板内容（避免覆盖用户剪贴板）
-                setTimeout(function () {
-                    client.clipboard_buffer = savedBuffer;
-                    client.clipboard_datatype = savedDatatype;
-                    // 恢复浏览器剪贴板
-                    if (savedBrowserClip !== null && navigator.clipboard && navigator.clipboard.writeText) {
-                        navigator.clipboard.writeText(savedBrowserClip).catch(function () {});
-                    }
-                    pasteLock = false;
-                }, 300);
-            }, 200);
-        }
-
-        // 尝试保存浏览器剪贴板内容（用于粘贴后恢复）
-        var savedBrowserClip = null;
-        if (navigator.clipboard && navigator.clipboard.readText) {
-            navigator.clipboard.readText().then(function (saved) {
-                savedBrowserClip = saved;
-            }).catch(function () {}).finally(function () {
-                doPaste();
-            });
-        } else {
-            doPaste();
-        }
+    document.addEventListener('compositionstart', function () {
+        isComposing = true;
+        console.log('[ime] 输入法组合开始');
     });
 
-    console.log('[ime] IME 输入法支持已加载');
+    document.addEventListener('compositionend', function (e) {
+        isComposing = false;
+        var text = e.data;
+        if (!text || typeLock) return;
+        console.log('[ime] 输入法完成:', text);
+
+        typeLock = true;
+        // 通过 HTTP POST 发送文本到服务器，服务器用 xdotool type 输入
+        fetch('/_type-text', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: text }),
+            credentials: 'same-origin'
+        }).then(function (resp) {
+            return resp.json();
+        }).then(function (data) {
+            if (data.ok) {
+                console.log('[ime] 文本已输入:', data.length, '字符');
+            } else {
+                console.error('[ime] 输入失败:', data.error);
+            }
+        }).catch(function (err) {
+            console.error('[ime] 请求异常:', err);
+        }).finally(function () {
+            setTimeout(function () { typeLock = false; }, 100);
+        });
+    });
+
+    // 等待 Xpra client 就绪后覆盖键盘处理
+    var patchTimer = setInterval(function () {
+        if (window.client && window.client.connected) {
+            if (patchXpraKeyboard()) {
+                clearInterval(patchTimer);
+            }
+        }
+    }, 500);
+
+    // 10 秒后停止尝试
+    setTimeout(function () { clearInterval(patchTimer); }, 10000);
+
+    console.log('[ime] IME 输入法支持已加载（xdotool type 模式）');
 })();
