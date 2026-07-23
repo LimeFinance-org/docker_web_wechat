@@ -404,3 +404,121 @@
 
     initWhenReady();
 })();
+
+// ============== 剪贴板同步（WeChat → 浏览器系统剪贴板）==============
+// 定期读取 X11 剪贴板（xclip -o），同步到浏览器系统剪贴板。
+// 用户可以在微信里复制文字，然后在浏览器外 Ctrl+V 粘贴。
+// 注意：HTTP 页面不能用 navigator.clipboard API，改用 execCommand。
+(function () {
+    'use strict';
+    if (window.__clipboardSyncLoaded) return;
+    window.__clipboardSyncLoaded = true;
+
+    var lastText = '';
+    var syncTimer = null;
+
+    function syncClipboard(text) {
+        // 用 textarea + execCommand 方式（兼容 HTTP 页面）
+        var ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.cssText = 'position:fixed;left:-9999px;top:-9999px';
+        document.body.appendChild(ta);
+        ta.select();
+        try {
+            document.execCommand('copy');
+            console.log('[clipboard] 已同步: ' + text.substring(0, 40));
+        } catch (e) {
+            // execCommand 在某些情况下不可用，静默失败
+        }
+        document.body.removeChild(ta);
+    }
+
+    function startSync() {
+        syncTimer = setInterval(function () {
+            fetch('/_clipboard-text', { credentials: 'same-origin', cache: 'no-store' })
+                .then(function (r) { return r.json(); })
+                .then(function (d) {
+                    if (!d.ok || !d.text) return;
+                    var text = d.text;
+                    if (text && text !== lastText) {
+                        lastText = text;
+                        // 过滤二进制/URI 列表数据
+                        if (text.startsWith('file://') || text.startsWith('x-special/')) return;
+                        if (text.length > 100000) return; // 跳过超长文本
+                        syncClipboard(text);
+                    }
+                }).catch(function () {});
+        }, 2000);
+    }
+
+    // 等待 Xpra client 就绪后启动
+    function waitForClient() {
+        if (window.client && window.client.connected) {
+            startSync();
+            console.log('[clipboard] 剪贴板同步已启动 (2s)');
+        } else {
+            setTimeout(waitForClient, 1000);
+        }
+    }
+    waitForClient();
+})();
+
+// ============== 文件下载监控（微信保存图片/文件 → 浏览器下载）==============
+// 定期扫描微信文件目录，检测新文件后自动触发浏览器下载对话框。
+// 首次加载时只记录已有文件，不触发下载；之后出现的新文件才自动下载。
+(function () {
+    'use strict';
+    if (window.__downloadWatcherLoaded) return;
+    window.__downloadWatcherLoaded = true;
+
+    var knownKeys = {};
+    var firstPoll = true;
+    var lastPollSizes = {};  // 防止文件还在写入就下载（等待大小稳定）
+
+    function triggerDownload(file) {
+        var url = '/_download-file?path=' + encodeURIComponent(file.path);
+        var a = document.createElement('a');
+        a.href = url;
+        a.download = file.name;
+        a.style.display = 'none';
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(function () { document.body.removeChild(a); }, 1000);
+        var kb = (file.size / 1024).toFixed(1);
+        console.log('[download] 下载: ' + file.name + ' (' + kb + ' KB)');
+    }
+
+    setInterval(function () {
+        fetch('/_list-downloads', { credentials: 'same-origin', cache: 'no-store' })
+            .then(function (r) { return r.json(); })
+            .then(function (d) {
+                if (!d.ok || !d.files) return;
+
+                d.files.forEach(function (file) {
+                    var key = file.path + '|' + file.mtime + '|' + file.size;
+                    var sizeKey = file.path + '|' + file.mtime;
+
+                    if (firstPoll) {
+                        // 首次轮询：只记录不下载
+                        knownKeys[key] = true;
+                        return;
+                    }
+
+                    if (knownKeys[key]) return;
+
+                    // 检查文件是否还在写入（大小不变才算稳定）
+                    if (lastPollSizes[sizeKey] === file.size && file.size > 0) {
+                        knownKeys[key] = true;
+                        triggerDownload(file);
+                    }
+                    lastPollSizes[sizeKey] = file.size;
+                });
+
+                if (firstPoll) {
+                    firstPoll = false;
+                    console.log('[download] 文件监控已启动 (3s)，已有 ' +
+                        Object.keys(knownKeys).length + ' 个文件');
+                }
+            }).catch(function () {});
+    }, 3000);
+})();

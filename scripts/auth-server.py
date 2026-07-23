@@ -151,8 +151,102 @@ class AuthHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             return
 
+        # 剪贴板同步（浏览器读取 X11 剪贴板）
+        if self.path == "/_clipboard-text":
+            self._handle_clipboard_text()
+            return
+
+        # 文件下载列表
+        if self.path == "/_list-downloads":
+            self._handle_list_downloads()
+            return
+
+        # 文件下载
+        if self.path.startswith("/_download-file"):
+            self._handle_download_file()
+            return
+
         self.send_response(HTTPStatus.NOT_FOUND)
         self.end_headers()
+
+    # ══════════ 剪贴板同步（GET）══════════
+    def _handle_clipboard_text(self):
+        """读取 X11 剪贴板文本，供浏览器同步到系统剪贴板"""
+        token = parse_cookie(self.headers.get("Cookie", ""))
+        if not (token and verify_token(token)):
+            self._json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "未登录"})
+            return
+        try:
+            result = subprocess.run(
+                ["xclip", "-o", "-selection", "clipboard"],
+                capture_output=True, text=True, timeout=2,
+                env={"DISPLAY": ":10"},
+            )
+            text = result.stdout if result.returncode == 0 else ""
+            self._json(HTTPStatus.OK, {"ok": True, "text": text})
+        except Exception as e:
+            self._json(HTTPStatus.OK, {"ok": True, "text": ""})
+
+    # ══════════ 文件下载列表（GET）══════════
+    def _handle_list_downloads(self):
+        """列出下载目录中的最近文件"""
+        token = parse_cookie(self.headers.get("Cookie", ""))
+        if not (token and verify_token(token)):
+            self._json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "未登录"})
+            return
+        dirs = ["/root/downloads", "/root/xwechat_files", "/tmp/wechat-paste"]
+        files = []
+        for d in dirs:
+            if not os.path.isdir(d):
+                continue
+            for dirpath, dirnames, filenames in os.walk(d):
+                for fn in filenames:
+                    fp = os.path.join(dirpath, fn)
+                    try:
+                        st = os.stat(fp)
+                        files.append({
+                            "name": fn,
+                            "path": fp,
+                            "size": st.st_size,
+                            "mtime": int(st.st_mtime),
+                        })
+                    except OSError:
+                        continue
+        files.sort(key=lambda f: f["mtime"], reverse=True)
+        self._json(HTTPStatus.OK, {"ok": True, "files": files[:30]})
+
+    # ══════════ 文件下载服务（GET）══════════
+    def _handle_download_file(self):
+        """提供文件下载"""
+        token = parse_cookie(self.headers.get("Cookie", ""))
+        if not (token and verify_token(token)):
+            self._json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "未登录"})
+            return
+        parsed = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(parsed.query)
+        filepath = query.get("path", [None])[0]
+        if not filepath or not os.path.isfile(filepath):
+            self._json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "文件不存在"})
+            return
+        allowed = ["/root/downloads", "/root/xwechat_files", "/tmp/wechat-paste"]
+        real = os.path.realpath(filepath)
+        if not any(real.startswith(os.path.realpath(d)) for d in allowed):
+            self._json(HTTPStatus.FORBIDDEN, {"ok": False, "error": "无权访问"})
+            return
+        filename = os.path.basename(filepath)
+        fsize = os.path.getsize(filepath)
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Disposition",
+                         f'attachment; filename="{urllib.parse.quote(filename)}"')
+        self.send_header("Content-Length", str(fsize))
+        self.end_headers()
+        with open(filepath, "rb") as f:
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
 
     def do_POST(self):
         # 登录表单提交
