@@ -291,14 +291,20 @@
 // ============== IME 输入法支持 ==============
 // 浏览器 IME 在 Xpra pasteboard 上组合中文 → compositionend → POST /_type-text → xdotool type → 微信
 //
-// 注意：不拦截 keydown！现代浏览器 IME 期间 keydown 自带 keyCode=229，
-// Xpra 的 _keyb_process 已跳过此类事件。调用 stopPropagation 反而会
-// 阻止键盘事件到达 pasteboard 的目标阶段，导致 compositionend 永不触发。
+// 关键架构：
+//   Xpra 在 document.addEventListener('keydown', ...) 中对 ALL 按键（包括 IME）
+//   都调用 e.preventDefault()，这会立即杀死浏览器 IME 组合。
+//
+//   解决方案：在 pasteboard 的冒泡阶段（target phase 之后）调用 stopPropagation，
+//   阻止 keydown 冒泡到 document（Xpra），但浏览器 IME 在 target 阶段已完成处理。
+//
+//   捕获阶段 vs 冒泡阶段的区别：
+//   - 捕获阶段 stopPropagation → 阻止 target 阶段 → IME 无法处理按键 → compositionend 不触发
+//   - 冒泡阶段 stopPropagation → target 阶段已完成 → IME 正常工作 → 只阻止 Xpra 收到事件
 //
 // 安全机制：
-//   - composition 超时重置
+//   - composition 超时重置（10 秒）
 //   - pasteboard 失焦/页面点击时复位
-//   - pasteboard 移到可视区域
 (function () {
     'use strict';
     if (window.__imeHelperLoaded) return;
@@ -316,16 +322,25 @@
         var pb = document.getElementById('pasteboard');
         if (!pb) { setTimeout(initWhenReady, 200); return; }
 
-        // 确保 pasteboard 不是 readonly
         if (pb.readOnly) { pb.readOnly = false; }
 
-        // 将 pasteboard 移到可视区域（left:-99em 浏览器可能拒绝 IME）
+        // pasteboard 移到可视区域
         pb.style.cssText = 'position:fixed;left:0;top:0;width:100%;height:100%;' +
             'opacity:0;pointer-events:none;z-index:-1;resize:none;' +
             'border:none;outline:none;padding:0;margin:0';
         console.log('[ime] pasteboard 已移到可视区域');
 
-        // ── IME 组合事件 ──
+        // ══════ 冒泡阶段 keydown：阻止 IME 按键冒泡到 Xpra ══════
+        // 必须在冒泡阶段（default=false）而非捕获阶段（true）！
+        // 冒泡阶段 = target 阶段之后 → 浏览器 IME 已处理 → 只阻止 Xpra
+        pb.addEventListener('keydown', function (e) {
+            if (isComposing || e.isComposing || e.keyCode === 229) {
+                e.stopPropagation();
+                // 不调 preventDefault — 让浏览器继续处理 IME
+            }
+        }, false);
+
+        // ══════ IME 组合事件 ══════
         pb.addEventListener('compositionstart', function () {
             isComposing = true;
             console.log('[ime] 组合开始');
@@ -362,16 +377,12 @@
               });
         });
 
-        // 失焦/点击时强制复位
         pb.addEventListener('blur', resetComposing);
         document.addEventListener('click', function () {
-            if (isComposing) {
-                console.log('[ime] 用户点击，强制复位');
-                resetComposing();
-            }
+            if (isComposing) { console.log('[ime] 点击复位'); resetComposing(); }
         });
 
-        console.log('[ime] IME 就绪（xdotool type 模式，不拦截 keydown）');
+        console.log('[ime] IME 就绪（冒泡阶段拦截 + xdotool type）');
     }
 
     initWhenReady();
