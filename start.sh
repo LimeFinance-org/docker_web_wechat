@@ -78,6 +78,11 @@ WEB_AUTH_USER="$WEB_AUTH_USER" WEB_AUTH_PASSWORD="$WEB_AUTH_PASSWORD" \
     AUTH_SECRET="$AUTH_SECRET" AUTH_PORT="$AUTH_PORT" AUTH_HOST="$AUTH_HOST" \
     python3 /usr/local/bin/auth-server.py &
 
+# ============== 启动文件对话框自动保存守护进程 ==============
+# 当微信弹出"另存为"对话框时，自动填入 /root/downloads/ 路径并确认保存。
+# 浏览器端文件监控检测到新文件后自动触发浏览器下载。
+bash /usr/local/bin/auto-save-dialog.sh &
+
 # ============== 配置 Xvfb 虚拟屏幕分辨率 ==============
 export XPRA_INITIAL_RESOLUTION="${XPRA_WIDTH}x${XPRA_HEIGHT}x24"
 

@@ -84,6 +84,10 @@ RUN chmod +x /usr/local/bin/notify-watcher.py
 COPY scripts/center-window.sh /usr/local/bin/center-window.sh
 RUN chmod +x /usr/local/bin/center-window.sh
 
+# 复制文件对话框自动保存脚本（检测另存为对话框，自动保存到 /root/downloads）
+COPY scripts/auto-save-dialog.sh /usr/local/bin/auto-save-dialog.sh
+RUN chmod +x /usr/local/bin/auto-save-dialog.sh
+
 # 复制微信启动包装脚本（启动前设置合理屏幕分辨率，避免窗口位置偏移）
 COPY scripts/start-wechat.sh /usr/local/bin/start-wechat.sh
 RUN chmod +x /usr/local/bin/start-wechat.sh

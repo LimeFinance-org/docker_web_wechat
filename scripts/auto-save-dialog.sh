@@ -1,0 +1,76 @@
+#!/bin/bash
+# 微信"另存为"对话框自动保存助手
+#
+# 原理：每 0.5 秒检测是否有文件保存对话框弹出。
+# 如果检测到，自动填入 /root/downloads/ 路径并按回车保存，
+# 文件就会被写入 /root/downloads/ 目录。
+# 浏览器端的 notify-inject.js 文件监控会检测到新文件并触发下载。
+#
+# 支持常见的文件对话框窗口标题：
+#   - Save As / 另存为 / 保存文件 / Save File
+#   - Choose a File / 选择文件
+
+set -e
+DISPLAY="${DISPLAY:-:10}"
+SAVE_DIR="/root/downloads"
+
+mkdir -p "$SAVE_DIR"
+
+echo "[auto-save] 文件对话框自动保存助手已启动，目标目录: $SAVE_DIR"
+echo "[auto-save] DISPLAY=$DISPLAY"
+
+# 记录已处理过的窗口 ID，避免重复处理
+declare -A HANDLED_WINDOWS
+
+while true; do
+    # 获取所有窗口列表
+    windows=$(wmctrl -l 2>/dev/null || true)
+
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+
+        # 提取窗口 ID 和标题
+        wid=$(echo "$line" | awk '{print $1}')
+        title=$(echo "$line" | cut -d' ' -f4-)
+
+        # 检查是否是文件保存对话框（匹配常见关键词）
+        is_save_dialog=0
+        for kw in "Save As" "Save" "save" "另存为" "保存" "Save File" \
+                   "Choose a File" "选择文件" "Select File" "Open File" \
+                   "打开文件" "Browse" "浏览"; do
+            if [[ "$title" == *"$kw"* ]]; then
+                is_save_dialog=1
+                break
+            fi
+        done
+
+        [[ $is_save_dialog -eq 0 ]] && continue
+
+        # 跳过已处理的窗口
+        if [[ -n "${HANDLED_WINDOWS[$wid]}" ]]; then
+            continue
+        fi
+
+        echo "[auto-save] 检测到文件保存对话框: [$wid] $title"
+
+        # 激活对话框窗口
+        xdotool windowactivate "$wid" 2>/dev/null || true
+        sleep 0.3
+
+        # 模拟键盘输入保存路径
+        # 先全选并清除当前路径
+        xdotool key ctrl+a 2>/dev/null || true
+        sleep 0.1
+        # 输入目标目录
+        xdotool type "$SAVE_DIR/" 2>/dev/null || true
+        sleep 0.2
+        # 确认保存（回车）
+        xdotool key Return 2>/dev/null || true
+        sleep 0.1
+
+        echo "[auto-save] 已自动保存到: $SAVE_DIR/"
+        HANDLED_WINDOWS[$wid]=1
+    done <<< "$windows"
+
+    sleep 0.5
+done
