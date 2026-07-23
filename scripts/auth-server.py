@@ -26,6 +26,7 @@ import base64
 import urllib.parse
 import subprocess
 import uuid
+import threading
 from http import HTTPStatus
 
 # ============== 配置 ==============
@@ -44,6 +45,10 @@ if not SECRET:
 
 COOKIE_NAME = "xwechat_session"
 COOKIE_MAX_AGE = 7 * 24 * 3600  # 7 天
+
+# 全局锁：确保 xdotool type 串行执行，避免并发输入导致字符乱序/丢失
+# ThreadingHTTPServer 会并发处理请求，但 xdotool 操作必须串行
+TYPE_LOCK = threading.Lock()
 
 # ============== Cookie 签名工具 ==============
 
@@ -177,10 +182,11 @@ class AuthHandler(http.server.BaseHTTPRequestHandler):
             self._json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "未登录"})
             return
         try:
+            display = os.environ.get("DISPLAY", ":100")
             result = subprocess.run(
                 ["xclip", "-o", "-selection", "clipboard"],
                 capture_output=True, text=True, timeout=2,
-                env={"DISPLAY": ":10"},
+                env={**os.environ, "DISPLAY": display},
             )
             text = result.stdout if result.returncode == 0 else ""
             self._json(HTTPStatus.OK, {"ok": True, "text": text})
@@ -368,14 +374,16 @@ class AuthHandler(http.server.BaseHTTPRequestHandler):
         env = {**os.environ, "DISPLAY": display}
 
         # 使用 xdotool type（XKB 修复后应能正确处理中文）
-        # 先确保键盘焦点在微信窗口上
+        # 加锁串行执行，避免并发请求导致字符乱序/丢失
+        # --delay 1：按键间隔 1ms（原 10ms 太慢，快速输入时请求堆积导致漏字）
         try:
-            subprocess.run(
-                ["xdotool", "type", "--clearmodifiers", "--delay", "10", text],
-                capture_output=True,
-                timeout=10,
-                env=env
-            )
+            with TYPE_LOCK:
+                subprocess.run(
+                    ["xdotool", "type", "--clearmodifiers", "--delay", "1", text],
+                    capture_output=True,
+                    timeout=10,
+                    env=env
+                )
             sys.stdout.write(f"[auth-server] xdotool type: {text[:50]}...\n")
             sys.stdout.flush()
         except FileNotFoundError:
@@ -580,8 +588,10 @@ class AuthHandler(http.server.BaseHTTPRequestHandler):
 def main():
     if not SECRET:
         sys.stderr.write("[auth-server] AUTH_SECRET 未设置，已自动生成（重启后失效）\n")
-    server = http.server.HTTPServer((HOST, PORT), AuthHandler)
-    sys.stdout.write(f"[auth-server] 监听 {HOST}:{PORT} (用户: {USERNAME})\n")
+    # 使用 ThreadingHTTPServer：并发处理 HTTP 请求（避免 paste 轮询/通知请求阻塞输入法请求）
+    # xdotool type 通过 TYPE_LOCK 串行化，保证输入顺序
+    server = http.server.ThreadingHTTPServer((HOST, PORT), AuthHandler)
+    sys.stdout.write(f"[auth-server] 监听 {HOST}:{PORT} (用户: {USERNAME}, 线程化)\n")
     sys.stdout.flush()
     try:
         server.serve_forever()
