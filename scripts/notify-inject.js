@@ -291,20 +291,14 @@
 // ============== IME 输入法支持 ==============
 // 浏览器 IME 在 Xpra pasteboard 上组合中文 → compositionend → POST /_type-text → xdotool type → 微信
 //
-// 关键架构：
-//   Xpra 在 document.addEventListener('keydown', ...) 中对 ALL 按键（包括 IME）
-//   都调用 e.preventDefault()，这会立即杀死浏览器 IME 组合。
+// 根本问题：Xpra 在 document keydown 中对所有按键无条件调用 e.preventDefault()，
+// 这会立即杀死浏览器 IME 组合会话，导致 compositionend 绝不触发。
 //
-//   解决方案：在 pasteboard 的冒泡阶段（target phase 之后）调用 stopPropagation，
-//   阻止 keydown 冒泡到 document（Xpra），但浏览器 IME 在 target 阶段已完成处理。
+// 之前的 stopPropagation 方案失败原因：第一个 IME 按键到达时 isComposing 还未设置
+// （compositionstart 尚未触发），拦截条件不匹配，事件仍到达 Xpra。
 //
-//   捕获阶段 vs 冒泡阶段的区别：
-//   - 捕获阶段 stopPropagation → 阻止 target 阶段 → IME 无法处理按键 → compositionend 不触发
-//   - 冒泡阶段 stopPropagation → target 阶段已完成 → IME 正常工作 → 只阻止 Xpra 收到事件
-//
-// 安全机制：
-//   - composition 超时重置（10 秒）
-//   - pasteboard 失焦/页面点击时复位
+// 新方案：在 document 捕获阶段检测 IME 按键，直接覆盖事件对象的 preventDefault 为空操作。
+// Xpra 依然会调用 preventDefault()，但无效 — 无法杀死 IME。事件正常传播。
 (function () {
     'use strict';
     if (window.__imeHelperLoaded) return;
@@ -324,21 +318,19 @@
 
         if (pb.readOnly) { pb.readOnly = false; }
 
-        // pasteboard 移到可视区域
         pb.style.cssText = 'position:fixed;left:0;top:0;width:100%;height:100%;' +
             'opacity:0;pointer-events:none;z-index:-1;resize:none;' +
             'border:none;outline:none;padding:0;margin:0';
         console.log('[ime] pasteboard 已移到可视区域');
 
-        // ══════ 冒泡阶段 keydown：阻止 IME 按键冒泡到 Xpra ══════
-        // 必须在冒泡阶段（default=false）而非捕获阶段（true）！
-        // 冒泡阶段 = target 阶段之后 → 浏览器 IME 已处理 → 只阻止 Xpra
-        pb.addEventListener('keydown', function (e) {
+        // ══════ 捕获阶段：覆盖 preventDefault（不阻止传播）══════
+        // 直接让 Xpra 的 e.preventDefault() 失效，而不是阻止事件传播。
+        // DOM 事件对象支持覆盖实例方法：设置后 Xpra 调用的是我们的空函数。
+        document.addEventListener('keydown', function (e) {
             if (isComposing || e.isComposing || e.keyCode === 229) {
-                e.stopPropagation();
-                // 不调 preventDefault — 让浏览器继续处理 IME
+                e.preventDefault = function () {};
             }
-        }, false);
+        }, true);
 
         // ══════ IME 组合事件 ══════
         pb.addEventListener('compositionstart', function () {
@@ -382,7 +374,7 @@
             if (isComposing) { console.log('[ime] 点击复位'); resetComposing(); }
         });
 
-        console.log('[ime] IME 就绪（冒泡阶段拦截 + xdotool type）');
+        console.log('[ime] IME 就绪（preventDefault 覆盖模式）');
     }
 
     initWhenReady();
