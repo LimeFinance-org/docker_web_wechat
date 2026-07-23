@@ -291,11 +291,14 @@
 // ============== IME 输入法支持 ==============
 // 浏览器 IME 在 Xpra pasteboard 上组合中文 → compositionend → POST /_type-text → xdotool type → 微信
 //
-// 安全机制（防止键盘永久卡死）：
-//   - composition 超时重置（10 秒后若未收到 compositionend，强制复位）
-//   - pasteboard 失焦时重置 isComposing
-//   - 页面点击时重置 isComposing
-//   - pasteboard 移到可视区域（left:-99em 会导致浏览器拒绝 IME 组合）
+// 注意：不拦截 keydown！现代浏览器 IME 期间 keydown 自带 keyCode=229，
+// Xpra 的 _keyb_process 已跳过此类事件。调用 stopPropagation 反而会
+// 阻止键盘事件到达 pasteboard 的目标阶段，导致 compositionend 永不触发。
+//
+// 安全机制：
+//   - composition 超时重置
+//   - pasteboard 失焦/页面点击时复位
+//   - pasteboard 移到可视区域
 (function () {
     'use strict';
     if (window.__imeHelperLoaded) return;
@@ -322,18 +325,10 @@
             'border:none;outline:none;padding:0;margin:0';
         console.log('[ime] pasteboard 已移到可视区域');
 
-        // 捕获阶段 keydown：IME 组合时阻止冒泡
-        pb.addEventListener('keydown', function (e) {
-            if (isComposing || e.isComposing || e.keyCode === 229) {
-                e.stopPropagation();
-            }
-        }, true);
-
         // ── IME 组合事件 ──
         pb.addEventListener('compositionstart', function () {
             isComposing = true;
             console.log('[ime] 组合开始');
-            // 安全超时：10 秒后若未收到 compositionend，强制复位
             if (compositionTimer) clearTimeout(compositionTimer);
             compositionTimer = setTimeout(function () {
                 if (isComposing) {
@@ -341,6 +336,10 @@
                     resetComposing();
                 }
             }, 10000);
+        });
+
+        pb.addEventListener('compositionupdate', function (e) {
+            console.log('[ime] 组合中:', e.data);
         });
 
         pb.addEventListener('compositionend', function (e) {
@@ -363,7 +362,7 @@
               });
         });
 
-        // 失焦/点击时强制复位（用户切走了，IME 不可能再继续）
+        // 失焦/点击时强制复位
         pb.addEventListener('blur', resetComposing);
         document.addEventListener('click', function () {
             if (isComposing) {
@@ -372,7 +371,7 @@
             }
         });
 
-        console.log('[ime] IME 就绪（xdotool type 模式）');
+        console.log('[ime] IME 就绪（xdotool type 模式，不拦截 keydown）');
     }
 
     initWhenReady();
