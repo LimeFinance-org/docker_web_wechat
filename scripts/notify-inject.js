@@ -330,8 +330,13 @@
     var compositionTimer = null;
     var sentInThisComposition = false;
 
+    function setComposing(v) {
+        isComposing = v;
+        window.__imeComposing = v;  // 暴露给剪贴板同步模块
+    }
+
     function resetComposing() {
-        isComposing = false;
+        setComposing(false);
         sentInThisComposition = false;
         if (compositionTimer) { clearTimeout(compositionTimer); compositionTimer = null; }
     }
@@ -398,7 +403,7 @@
 
         // ══════ IME 状态跟踪 ══════
         pb.addEventListener('compositionstart', function () {
-            isComposing = true;
+            setComposing(true);
             sentInThisComposition = false;
             pb.value = '';
             if (compositionTimer) clearTimeout(compositionTimer);
@@ -441,12 +446,20 @@
         // 过滤二进制/URI 列表
         if (cachedText.startsWith('file://') || cachedText.startsWith('x-special/')) return;
         if (cachedText.length > 50000) return;
+        // IME 组合期间绝对不能动焦点（会杀死中文输入）
+        if (window.__imeComposing) return;
 
         var ta = document.createElement('textarea');
         ta.value = cachedText;
-        ta.style.cssText = 'position:fixed;left:-9999px;top:-9999px';
+        ta.setAttribute('readonly', '');
+        ta.style.cssText = 'position:fixed;left:-9999px;top:-9999px;opacity:0';
         document.body.appendChild(ta);
-        ta.select();
+        // 用 Selection API 而非 focus()，减少对 pasteboard 焦点的影响
+        var sel = window.getSelection();
+        var range = document.createRange();
+        range.selectNodeContents(ta);
+        sel.removeAllRanges();
+        sel.addRange(range);
         try {
             var ok = document.execCommand('copy');
             if (ok) {
@@ -454,6 +467,7 @@
                 console.log('[clipboard] 同步: ' + cachedText.substring(0, 40));
             }
         } catch (e) {}
+        sel.removeAllRanges();
         document.body.removeChild(ta);
     }
 
@@ -468,19 +482,9 @@
             }).catch(function () {});
     }, 1500);
 
-    // 用户手势事件中应用剪贴板（execCommand 需要用户手势）
-    // canvas 点击、compositionend 都是用户手势
+    // 只在 click 时尝试同步（用户主动点击，不会干扰 IME）
+    // 注意：不再在 compositionend/keydown 时触发，避免抢焦点
     document.addEventListener('click', tryApplyClipboard, true);
-    document.addEventListener('compositionend', function () {
-        setTimeout(tryApplyClipboard, 100);
-    }, true);
-
-    // 键盘事件也能作为用户手势（Ctrl+C 复制后往往跟着按键）
-    var keyGestureTimer = null;
-    document.addEventListener('keydown', function () {
-        if (keyGestureTimer) clearTimeout(keyGestureTimer);
-        keyGestureTimer = setTimeout(tryApplyClipboard, 300);
-    }, true);
 
     console.log('[clipboard] 剪贴板同步就绪（缓存+手势触发）');
 })();

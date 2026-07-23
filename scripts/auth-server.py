@@ -205,8 +205,38 @@ class AuthHandler(http.server.BaseHTTPRequestHandler):
                     fp = os.path.join(dirpath, fn)
                     try:
                         st = os.stat(fp)
+                        # 文件刚创建可能还在写入，跳过 1 秒内的
+                        import time
+                        if time.time() - st.st_mtime < 1:
+                            continue
+                        # 如果文件名没有后缀，用 file 命令推断后缀
+                        name = fn
+                        if '.' not in fn:
+                            try:
+                                out = subprocess.run(
+                                    ["file", "--mime-type", "-b", fp],
+                                    capture_output=True, text=True, timeout=2,
+                                ).stdout.strip()
+                                ext_map = {
+                                    "image/jpeg": ".jpg", "image/png": ".png",
+                                    "image/gif": ".gif", "image/webp": ".webp",
+                                    "image/bmp": ".bmp", "image/tiff": ".tiff",
+                                    "video/mp4": ".mp4", "video/webm": ".webm",
+                                    "audio/mpeg": ".mp3", "audio/ogg": ".ogg",
+                                    "application/pdf": ".pdf",
+                                    "application/zip": ".zip",
+                                    "application/x-tar": ".tar",
+                                    "application/vnd.ms-excel": ".xls",
+                                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+                                    "application/msword": ".doc",
+                                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+                                }
+                                if out in ext_map:
+                                    name = fn + ext_map[out]
+                            except Exception:
+                                pass
                         files.append({
-                            "name": fn,
+                            "name": name,
                             "path": fp,
                             "size": st.st_size,
                             "mtime": int(st.st_mtime),

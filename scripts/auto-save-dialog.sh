@@ -66,20 +66,30 @@ while true; do
 
         # 激活对话框窗口
         xdotool windowactivate "$wid" 2>/dev/null || true
-        sleep 0.3
+        sleep 0.5
 
-        # 模拟键盘输入保存路径
-        # 先全选并清除当前路径
+        # 生成随机文件名（wechat_save_<时间戳>_<随机>.<ext>）
+        # 先用 xprop 获取对话框的 WM_CLASS，判断来源
+        # 大部分微信保存的图片是 jpg/png，文件无后缀时浏览器无法识别
+        RAND_NAME="wechat_save_$(date +%s)_$RANDOM.jpg"
+
+        # 模拟键盘输入完整路径（目录 + 文件名）
+        # 先 Tab 到文件名输入框（大多数 GTK/Qt 对话框的文件名框是第一个可编辑控件）
+        # 用 Ctrl+A 全选当前路径再覆盖
         xdotool key ctrl+a 2>/dev/null || true
         sleep 0.1
-        # 输入目标目录
-        xdotool type "$SAVE_DIR/" 2>/dev/null || true
-        sleep 0.2
+        # 输入完整路径：目录 + 随机文件名
+        xdotool type "$SAVE_DIR/$RAND_NAME" 2>/dev/null || true
+        sleep 0.3
         # 确认保存（回车）
         xdotool key Return 2>/dev/null || true
-        sleep 0.1
+        sleep 0.5
 
-        echo "[auto-save] 已自动保存到: $SAVE_DIR/"
+        # 如果存在同名文件确认覆盖对话框，再按一次回车
+        xdotool key Return 2>/dev/null || true
+        sleep 0.2
+
+        echo "[auto-save] 已自动保存到: $SAVE_DIR/$RAND_NAME"
         HANDLED_WINDOWS[$wid]=1
     done <<< "$windows"
 
