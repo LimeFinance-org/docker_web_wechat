@@ -314,12 +314,13 @@
 })();
 
 // ============== IME 输入法支持 + 文本粘贴 ==============
-// 双通道方案：
-//   1. Ctrl+V 文本粘贴 → paste 事件拦截 → /_type-text → xdotool type（已在上面实现）
-//   2. 浏览器 IME 输入 → input 事件（isComposing=false）→ /_type-text → xdotool type
+// 中文输入双通道：
+//   1. Ctrl+V 文本粘贴 → paste 事件 → /_type-text → xdotool type
+//   2. IME 输入 → compositionend（主）+ input（备用）→ /_type-text → xdotool type
 //
-// input 事件比 compositionend 更可靠：即使 Xpra 的 preventDefault 影响了 IME，
-// input 事件在 DOM 值变更时也会触发，isComposing=false 表示最终文字。
+// 漏字原因：input 事件在 isComposing=false 时可能逐字触发（用户短暂停顿），
+// 每次触发都会清空 pb.value，导致后续字符丢失。
+// 修复：compositionend 为主触发，input(isComposing=false) 为兜底。
 (function () {
     'use strict';
     if (window.__imeHelperLoaded) return;
@@ -327,14 +328,16 @@
 
     var isComposing = false;
     var compositionTimer = null;
+    var sentInThisComposition = false;
 
     function resetComposing() {
         isComposing = false;
+        sentInThisComposition = false;
         if (compositionTimer) { clearTimeout(compositionTimer); compositionTimer = null; }
     }
 
     function sendText(text) {
-        if (!text) return;
+        if (!text || !text.trim()) return;
         console.log('[ime] 发送:', text.substring(0, 50));
         fetch('/_type-text', {
             method: 'POST',
@@ -356,116 +359,135 @@
 
         if (pb.readOnly) { pb.readOnly = false; }
 
-        // pasteboard 移到可视区域并提权（高 z-index 有助 IME 激活）
         pb.style.cssText = 'position:fixed;left:0;top:0;width:100%;height:100%;' +
             'opacity:0;pointer-events:none;z-index:999999;resize:none;' +
             'border:none;outline:none;padding:0;margin:0';
         console.log('[ime] pasteboard 已就位');
 
-        // ══════ input 事件：最终文本捕获 ══════
-        // input 在 DOM value 变更时触发。isComposing=false 时是最终文字。
-        pb.addEventListener('input', function (e) {
-            if (e.isComposing) return;  // 跳过中间态
-            var text = pb.value || '';
-            if (!text) return;
-            pb.value = '';  // 清空，避免重复发送
-            sendText(text);
-        });
-
-        // ══════ IME 组合事件（日志用）══════
-        pb.addEventListener('compositionstart', function () {
-            isComposing = true;
-            pb.value = '';  // 清空旧值
-            if (compositionTimer) clearTimeout(compositionTimer);
-            compositionTimer = setTimeout(function () {
-                if (isComposing) {
-                    console.warn('[ime] 组合超时');
-                    resetComposing();
-                }
-            }, 10000);
-        });
-
-        pb.addEventListener('compositionend', function () {
-            resetComposing();
-            // input 事件会紧接着触发并处理文本，这里不需要额外操作
-        });
-
-        pb.addEventListener('blur', function () {
+        // ══════ compositionend：主要触发 ══════
+        // 用户确认组合（空格/回车）时触发，e.data 包含完整文本
+        pb.addEventListener('compositionend', function (e) {
+            var text = (e.data || '').trim();
+            if (text) {
+                sendText(text);
+                sentInThisComposition = true;
+            }
             resetComposing();
             pb.value = '';
         });
 
-        document.addEventListener('click', function () {
+        // ══════ input 事件：兜底方案 ══════
+        // 仅在 compositionend 失败时使用（比如浏览器 IME 异常未触发 compositionend）
+        pb.addEventListener('input', function (e) {
+            if (e.isComposing) return;
+            if (sentInThisComposition) return;  // compositionend 已处理
+            var text = (pb.value || '').trim();
+            if (!text) return;
+            // 短暂延迟，确认没有后续的 compositionend
+            setTimeout(function () {
+                if (!sentInThisComposition) {
+                    var t = (pb.value || '').trim();
+                    if (t && t === text) {
+                        sendText(t);
+                    }
+                    pb.value = '';
+                    resetComposing();
+                }
+            }, 150);
+        });
+
+        // ══════ IME 状态跟踪 ══════
+        pb.addEventListener('compositionstart', function () {
+            isComposing = true;
+            sentInThisComposition = false;
+            pb.value = '';
+            if (compositionTimer) clearTimeout(compositionTimer);
+            compositionTimer = setTimeout(function () {
+                if (isComposing) {
+                    console.warn('[ime] 组合超时，发送已输入文本');
+                    var t = (pb.value || '').trim();
+                    if (t) sendText(t);
+                    resetComposing();
+                }
+            }, 15000);
+        });
+
+        pb.addEventListener('blur', function () {
             if (isComposing) { resetComposing(); pb.value = ''; }
         });
 
-        console.log('[ime] IME 就绪（input 事件模式）');
+        console.log('[ime] IME 就绪（compositionend 主 + input 兜底）');
     }
 
     initWhenReady();
 })();
 
 // ============== 剪贴板同步（WeChat → 浏览器系统剪贴板）==============
-// 定期读取 X11 剪贴板（xclip -o），同步到浏览器系统剪贴板。
-// 用户可以在微信里复制文字，然后在浏览器外 Ctrl+V 粘贴。
-// 注意：HTTP 页面不能用 navigator.clipboard API，改用 execCommand。
+// 原理：定时轮询 X11 剪贴板（xclip -o），缓存最新文本；在用户交互（点击、
+// 输入法确认等用户手势事件）中调用 execCommand('copy') 写入系统剪贴板。
+//
+// 关键：HTTP 页面 execCommand('copy') 需要用户手势才能生效，
+// setInterval 中调用会静默失败。所以采用"缓存+手势触发"模式。
 (function () {
     'use strict';
     if (window.__clipboardSyncLoaded) return;
     window.__clipboardSyncLoaded = true;
 
-    var lastText = '';
-    var syncTimer = null;
+    var cachedText = '';
+    var lastApplied = '';
 
-    function syncClipboard(text) {
-        // 用 textarea + execCommand 方式（兼容 HTTP 页面）
+    function tryApplyClipboard() {
+        if (!cachedText || cachedText === lastApplied) return;
+        // 过滤二进制/URI 列表
+        if (cachedText.startsWith('file://') || cachedText.startsWith('x-special/')) return;
+        if (cachedText.length > 50000) return;
+
         var ta = document.createElement('textarea');
-        ta.value = text;
+        ta.value = cachedText;
         ta.style.cssText = 'position:fixed;left:-9999px;top:-9999px';
         document.body.appendChild(ta);
         ta.select();
         try {
-            document.execCommand('copy');
-            console.log('[clipboard] 已同步: ' + text.substring(0, 40));
-        } catch (e) {
-            // execCommand 在某些情况下不可用，静默失败
-        }
+            var ok = document.execCommand('copy');
+            if (ok) {
+                lastApplied = cachedText;
+                console.log('[clipboard] 同步: ' + cachedText.substring(0, 40));
+            }
+        } catch (e) {}
         document.body.removeChild(ta);
     }
 
-    function startSync() {
-        syncTimer = setInterval(function () {
-            fetch('/_clipboard-text', { credentials: 'same-origin', cache: 'no-store' })
-                .then(function (r) { return r.json(); })
-                .then(function (d) {
-                    if (!d.ok || !d.text) return;
-                    var text = d.text;
-                    if (text && text !== lastText) {
-                        lastText = text;
-                        // 过滤二进制/URI 列表数据
-                        if (text.startsWith('file://') || text.startsWith('x-special/')) return;
-                        if (text.length > 100000) return; // 跳过超长文本
-                        syncClipboard(text);
-                    }
-                }).catch(function () {});
-        }, 2000);
-    }
+    // 后台轮询 X11 剪贴板（不需要用户手势，仅读取和缓存）
+    setInterval(function () {
+        fetch('/_clipboard-text', { credentials: 'same-origin', cache: 'no-store' })
+            .then(function (r) { return r.json(); })
+            .then(function (d) {
+                if (d.ok && d.text && d.text.trim()) {
+                    cachedText = d.text;
+                }
+            }).catch(function () {});
+    }, 1500);
 
-    // 等待 Xpra client 就绪后启动
-    function waitForClient() {
-        if (window.client && window.client.connected) {
-            startSync();
-            console.log('[clipboard] 剪贴板同步已启动 (2s)');
-        } else {
-            setTimeout(waitForClient, 1000);
-        }
-    }
-    waitForClient();
+    // 用户手势事件中应用剪贴板（execCommand 需要用户手势）
+    // canvas 点击、compositionend 都是用户手势
+    document.addEventListener('click', tryApplyClipboard, true);
+    document.addEventListener('compositionend', function () {
+        setTimeout(tryApplyClipboard, 100);
+    }, true);
+
+    // 键盘事件也能作为用户手势（Ctrl+C 复制后往往跟着按键）
+    var keyGestureTimer = null;
+    document.addEventListener('keydown', function () {
+        if (keyGestureTimer) clearTimeout(keyGestureTimer);
+        keyGestureTimer = setTimeout(tryApplyClipboard, 300);
+    }, true);
+
+    console.log('[clipboard] 剪贴板同步就绪（缓存+手势触发）');
 })();
 
 // ============== 文件下载监控（微信保存图片/文件 → 浏览器下载）==============
-// 定期扫描微信文件目录，检测新文件后自动触发浏览器下载对话框。
-// 首次加载时只记录已有文件，不触发下载；之后出现的新文件才自动下载。
+// 定期扫描微信文件目录，检测新文件后自动触发浏览器下载。
+// 微信"另存为"会弹出容器内文件对话框（无法阻止），但文件保存后会自动触发浏览器下载。
 (function () {
     'use strict';
     if (window.__downloadWatcherLoaded) return;
@@ -473,7 +495,7 @@
 
     var knownKeys = {};
     var firstPoll = true;
-    var lastPollSizes = {};  // 防止文件还在写入就下载（等待大小稳定）
+    var pendingFiles = {};  // 等待大小稳定的文件: key -> {file, lastSize}
 
     function triggerDownload(file) {
         var url = '/_download-file?path=' + encodeURIComponent(file.path);
@@ -496,29 +518,38 @@
 
                 d.files.forEach(function (file) {
                     var key = file.path + '|' + file.mtime + '|' + file.size;
-                    var sizeKey = file.path + '|' + file.mtime;
+                    var sizeKey = file.path + '|' + file.name;
 
                     if (firstPoll) {
-                        // 首次轮询：只记录不下载
                         knownKeys[key] = true;
                         return;
                     }
-
                     if (knownKeys[key]) return;
 
-                    // 检查文件是否还在写入（大小不变才算稳定）
-                    if (lastPollSizes[sizeKey] === file.size && file.size > 0) {
+                    // 文件大小稳定（写入完成）才触发下载
+                    var prev = pendingFiles[sizeKey];
+                    if (prev && prev.lastSize === file.size && file.size > 0) {
                         knownKeys[key] = true;
+                        delete pendingFiles[sizeKey];
                         triggerDownload(file);
+                    } else {
+                        pendingFiles[sizeKey] = { file: file, lastSize: file.size, seen: Date.now() };
                     }
-                    lastPollSizes[sizeKey] = file.size;
+                });
+
+                // 清理超时未稳定的待定文件（30 秒）
+                var now = Date.now();
+                Object.keys(pendingFiles).forEach(function (k) {
+                    if (now - pendingFiles[k].seen > 30000) {
+                        delete pendingFiles[k];
+                    }
                 });
 
                 if (firstPoll) {
                     firstPoll = false;
-                    console.log('[download] 文件监控已启动 (3s)，已有 ' +
+                    console.log('[download] 文件监控启动 (1.5s)，已有 ' +
                         Object.keys(knownKeys).length + ' 个文件');
                 }
             }).catch(function () {});
-    }, 3000);
+    }, 1500);
 })();
