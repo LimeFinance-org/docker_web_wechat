@@ -262,7 +262,32 @@
     }
 
     document.addEventListener('paste', function (event) {
-        var items = event.clipboardData && event.clipboardData.items;
+        var clipboard = event.clipboardData;
+        if (!clipboard) return;
+
+        // ── 优先处理文本粘贴（解决 Ctrl+V 中文粘贴问题）──
+        var text = clipboard.getData('text/plain');
+        if (text) {
+            event.preventDefault();
+            event.stopPropagation();
+            console.log('[paste] 文本粘贴:', text.substring(0, 50));
+            fetch('/_type-text', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text: text }),
+                credentials: 'same-origin'
+            }).then(function (r) { return r.json(); })
+              .then(function (d) {
+                  if (d.ok) console.log('[paste] 文本已发送');
+                  else console.error('[paste] 文本发送失败:', d.error);
+              }).catch(function (err) {
+                  console.error('[paste] 异常:', err);
+              });
+            return;
+        }
+
+        // ── 图片/文件粘贴（原有逻辑）──
+        var items = clipboard.items;
         if (!items) return;
         var handled = false;
         for (var i = 0; i < items.length; i++) {
@@ -270,7 +295,7 @@
             if (item.type && item.type.indexOf('image/') === 0) {
                 var blob = item.getAsFile();
                 if (!blob) continue;
-                handled = true; event.preventDefault();
+                handled = true;
                 console.log('[paste] 检测到图片:', item.type, blob.size);
                 blobToUint8(blob).then(function (u8) {
                     sendImageToClipboard(u8, item.type || 'image/png');
@@ -278,7 +303,7 @@
             } else if (item.kind === 'file' && (!item.type || item.type.indexOf('image/') !== 0)) {
                 var f = item.getAsFile();
                 if (!f) continue;
-                handled = true; event.preventDefault();
+                handled = true;
                 console.log('[paste] 检测到文件:', f.name, f.size);
                 uploadFile(f);
             }
@@ -288,17 +313,13 @@
     console.log('[paste] 粘贴助手已就绪');
 })();
 
-// ============== IME 输入法支持 ==============
-// 浏览器 IME 在 Xpra pasteboard 上组合中文 → compositionend → POST /_type-text → xdotool type → 微信
+// ============== IME 输入法支持 + 文本粘贴 ==============
+// 双通道方案：
+//   1. Ctrl+V 文本粘贴 → paste 事件拦截 → /_type-text → xdotool type（已在上面实现）
+//   2. 浏览器 IME 输入 → input 事件（isComposing=false）→ /_type-text → xdotool type
 //
-// 根本问题：Xpra 在 document keydown 中对所有按键无条件调用 e.preventDefault()，
-// 这会立即杀死浏览器 IME 组合会话，导致 compositionend 绝不触发。
-//
-// 之前的 stopPropagation 方案失败原因：第一个 IME 按键到达时 isComposing 还未设置
-// （compositionstart 尚未触发），拦截条件不匹配，事件仍到达 Xpra。
-//
-// 新方案：在 document 捕获阶段检测 IME 按键，直接覆盖事件对象的 preventDefault 为空操作。
-// Xpra 依然会调用 preventDefault()，但无效 — 无法杀死 IME。事件正常传播。
+// input 事件比 compositionend 更可靠：即使 Xpra 的 preventDefault 影响了 IME，
+// input 事件在 DOM 值变更时也会触发，isComposing=false 表示最终文字。
 (function () {
     'use strict';
     if (window.__imeHelperLoaded) return;
@@ -312,69 +333,73 @@
         if (compositionTimer) { clearTimeout(compositionTimer); compositionTimer = null; }
     }
 
+    function sendText(text) {
+        if (!text) return;
+        console.log('[ime] 发送:', text.substring(0, 50));
+        fetch('/_type-text', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: text }),
+            credentials: 'same-origin'
+        }).then(function (r) { return r.json(); })
+          .then(function (d) {
+              if (d.ok) console.log('[ime] 已输入:', text.substring(0, 30));
+              else console.error('[ime] 失败:', d.error);
+          }).catch(function (err) {
+              console.error('[ime] 异常:', err);
+          });
+    }
+
     function initWhenReady() {
         var pb = document.getElementById('pasteboard');
         if (!pb) { setTimeout(initWhenReady, 200); return; }
 
         if (pb.readOnly) { pb.readOnly = false; }
 
+        // pasteboard 移到可视区域并提权（高 z-index 有助 IME 激活）
         pb.style.cssText = 'position:fixed;left:0;top:0;width:100%;height:100%;' +
-            'opacity:0;pointer-events:none;z-index:-1;resize:none;' +
+            'opacity:0;pointer-events:none;z-index:999999;resize:none;' +
             'border:none;outline:none;padding:0;margin:0';
-        console.log('[ime] pasteboard 已移到可视区域');
+        console.log('[ime] pasteboard 已就位');
 
-        // ══════ 捕获阶段：覆盖 preventDefault（不阻止传播）══════
-        // 直接让 Xpra 的 e.preventDefault() 失效，而不是阻止事件传播。
-        // DOM 事件对象支持覆盖实例方法：设置后 Xpra 调用的是我们的空函数。
-        document.addEventListener('keydown', function (e) {
-            if (isComposing || e.isComposing || e.keyCode === 229) {
-                e.preventDefault = function () {};
-            }
-        }, true);
+        // ══════ input 事件：最终文本捕获 ══════
+        // input 在 DOM value 变更时触发。isComposing=false 时是最终文字。
+        pb.addEventListener('input', function (e) {
+            if (e.isComposing) return;  // 跳过中间态
+            var text = pb.value || '';
+            if (!text) return;
+            pb.value = '';  // 清空，避免重复发送
+            sendText(text);
+        });
 
-        // ══════ IME 组合事件 ══════
+        // ══════ IME 组合事件（日志用）══════
         pb.addEventListener('compositionstart', function () {
             isComposing = true;
-            console.log('[ime] 组合开始');
+            pb.value = '';  // 清空旧值
             if (compositionTimer) clearTimeout(compositionTimer);
             compositionTimer = setTimeout(function () {
                 if (isComposing) {
-                    console.warn('[ime] 组合超时，强制复位');
+                    console.warn('[ime] 组合超时');
                     resetComposing();
                 }
             }, 10000);
         });
 
-        pb.addEventListener('compositionupdate', function (e) {
-            console.log('[ime] 组合中:', e.data);
-        });
-
-        pb.addEventListener('compositionend', function (e) {
+        pb.addEventListener('compositionend', function () {
             resetComposing();
-            var text = e.data || '';
-            if (!text) return;
-            console.log('[ime] 组合完成:', text);
-
-            fetch('/_type-text', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ text: text }),
-                credentials: 'same-origin'
-            }).then(function (r) { return r.json(); })
-              .then(function (d) {
-                  if (d.ok) console.log('[ime] 已输入:', text);
-                  else console.error('[ime] 失败:', d.error);
-              }).catch(function (err) {
-                  console.error('[ime] 异常:', err);
-              });
+            // input 事件会紧接着触发并处理文本，这里不需要额外操作
         });
 
-        pb.addEventListener('blur', resetComposing);
+        pb.addEventListener('blur', function () {
+            resetComposing();
+            pb.value = '';
+        });
+
         document.addEventListener('click', function () {
-            if (isComposing) { console.log('[ime] 点击复位'); resetComposing(); }
+            if (isComposing) { resetComposing(); pb.value = ''; }
         });
 
-        console.log('[ime] IME 就绪（preventDefault 覆盖模式）');
+        console.log('[ime] IME 就绪（input 事件模式）');
     }
 
     initWhenReady();
