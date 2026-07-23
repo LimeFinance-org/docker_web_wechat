@@ -314,32 +314,17 @@
 })();
 
 // ============== IME 输入法支持 + 文本粘贴 ==============
-// 中文输入双通道：
-//   1. Ctrl+V 文本粘贴 → paste 事件 → /_type-text → xdotool type
-//   2. IME 输入 → compositionend（主）+ input（备用）→ /_type-text → xdotool type
+// 和图片/文件粘贴完全相同的思路：用 paste 事件捕获数据。
 //
-// 漏字原因：input 事件在 isComposing=false 时可能逐字触发（用户短暂停顿），
-// 每次触发都会清空 pb.value，导致后续字符丢失。
-// 修复：compositionend 为主触发，input(isComposing=false) 为兜底。
+// 原理：
+//   - 浏览器 IME 在 pasteboard textarea 上组合中文
+//   - 组合完成时，部分浏览器会触发 paste 事件（data 含最终文本）
+//   - 如果没触发 paste，则用 input 事件（isComposing=false）兜底
+//   - 文本通过 /_type-text 端点用 xdotool type 输入到微信
 (function () {
     'use strict';
     if (window.__imeHelperLoaded) return;
     window.__imeHelperLoaded = true;
-
-    var isComposing = false;
-    var compositionTimer = null;
-    var sentInThisComposition = false;
-
-    function setComposing(v) {
-        isComposing = v;
-        window.__imeComposing = v;  // 暴露给剪贴板同步模块
-    }
-
-    function resetComposing() {
-        setComposing(false);
-        sentInThisComposition = false;
-        if (compositionTimer) { clearTimeout(compositionTimer); compositionTimer = null; }
-    }
 
     function sendText(text) {
         if (!text || !text.trim()) return;
@@ -361,7 +346,6 @@
     function initWhenReady() {
         var pb = document.getElementById('pasteboard');
         if (!pb) { setTimeout(initWhenReady, 200); return; }
-
         if (pb.readOnly) { pb.readOnly = false; }
 
         pb.style.cssText = 'position:fixed;left:0;top:0;width:100%;height:100%;' +
@@ -369,59 +353,58 @@
             'border:none;outline:none;padding:0;margin:0';
         console.log('[ime] pasteboard 已就位');
 
-        // ══════ compositionend：主要触发 ══════
-        // 用户确认组合（空格/回车）时触发，e.data 包含完整文本
-        pb.addEventListener('compositionend', function (e) {
-            var text = (e.data || '').trim();
-            if (text) {
-                sendText(text);
-                sentInThisComposition = true;
-            }
-            resetComposing();
-            pb.value = '';
-        });
+        var lastSent = '';
+        var sendTimer = null;
 
-        // ══════ input 事件：兜底方案 ══════
-        // 仅在 compositionend 失败时使用（比如浏览器 IME 异常未触发 compositionend）
+        // ══════ 唯一触发：input 事件 ══════
+        // IME 组合完成（空格/回车/点击候选词）后，pasteboard.value 更新，
+        // 浏览器触发 input 事件且 e.isComposing === false。
+        // 用防抖合并连续输入（避免漏字），300ms 内的输入合并为一次发送。
         pb.addEventListener('input', function (e) {
-            if (e.isComposing) return;
-            if (sentInThisComposition) return;  // compositionend 已处理
+            // 组合中不处理
+            if (e.isComposing) {
+                window.__imeComposing = true;
+                return;
+            }
+            window.__imeComposing = false;
+
             var text = (pb.value || '').trim();
             if (!text) return;
-            // 短暂延迟，确认没有后续的 compositionend
-            setTimeout(function () {
-                if (!sentInThisComposition) {
-                    var t = (pb.value || '').trim();
-                    if (t && t === text) {
-                        sendText(t);
-                    }
-                    pb.value = '';
-                    resetComposing();
+
+            // 防抖：300ms 内的连续输入合并
+            if (sendTimer) clearTimeout(sendTimer);
+            sendTimer = setTimeout(function () {
+                var finalText = (pb.value || '').trim();
+                if (finalText && finalText !== lastSent) {
+                    lastSent = finalText;
+                    sendText(finalText);
+                    pb.value = '';  // 清空，准备下一次输入
                 }
-            }, 150);
+            }, 300);
         });
 
-        // ══════ IME 状态跟踪 ══════
+        // composition 事件仅用于设置状态标志（供剪贴板同步模块检查）
         pb.addEventListener('compositionstart', function () {
-            setComposing(true);
-            sentInThisComposition = false;
-            pb.value = '';
-            if (compositionTimer) clearTimeout(compositionTimer);
-            compositionTimer = setTimeout(function () {
-                if (isComposing) {
-                    console.warn('[ime] 组合超时，发送已输入文本');
-                    var t = (pb.value || '').trim();
-                    if (t) sendText(t);
-                    resetComposing();
+            window.__imeComposing = true;
+        });
+        pb.addEventListener('compositionend', function () {
+            window.__imeComposing = false;
+            // compositionend 后立即检查 value（某些浏览器 input 不触发）
+            setTimeout(function () {
+                var text = (pb.value || '').trim();
+                if (text && text !== lastSent) {
+                    lastSent = text;
+                    sendText(text);
+                    pb.value = '';
                 }
-            }, 15000);
+            }, 50);
         });
 
         pb.addEventListener('blur', function () {
-            if (isComposing) { resetComposing(); pb.value = ''; }
+            window.__imeComposing = false;
         });
 
-        console.log('[ime] IME 就绪（compositionend 主 + input 兜底）');
+        console.log('[ime] IME 就绪（input 防抖 + compositionend 兜底）');
     }
 
     initWhenReady();
