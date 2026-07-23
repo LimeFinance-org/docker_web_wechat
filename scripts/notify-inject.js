@@ -328,40 +328,59 @@
 
     function sendText(text) {
         if (!text || !text.trim()) return;
-        console.log('[ime] 发送:', text.substring(0, 50));
         fetch('/_type-text', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ text: text }),
             credentials: 'same-origin'
-        }).then(function (r) { return r.json(); })
-          .then(function (d) {
-              if (d.ok) console.log('[ime] 已输入:', text.substring(0, 30));
-              else console.error('[ime] 失败:', d.error);
-          }).catch(function (err) {
-              console.error('[ime] 异常:', err);
-          });
+        }).catch(function () {});
     }
 
     function initWhenReady() {
+        // 等待 Xpra 的 #pasteboard 元素出现（Xpra 连接后动态创建）
         var pb = document.getElementById('pasteboard');
-        if (!pb) { setTimeout(initWhenReady, 200); return; }
+        if (!pb) {
+            // 用 MutationObserver 等待 pasteboard 被创建
+            var observer = new MutationObserver(function (mutations, obs) {
+                var el = document.getElementById('pasteboard');
+                if (el) {
+                    obs.disconnect();
+                    setupIME(el);
+                }
+            });
+            observer.observe(document.body, { childList: true, subtree: true });
+            // 同时设置超时轮询作为备份
+            var retryCount = 0;
+            var retryTimer = setInterval(function () {
+                var el = document.getElementById('pasteboard');
+                if (el || retryCount++ > 100) {
+                    clearInterval(retryTimer);
+                    if (el) setupIME(el);
+                }
+            }, 200);
+            console.log('[ime] 等待 Xpra pasteboard 元素...');
+            return;
+        }
+        setupIME(pb);
+    }
+
+    function setupIME(pb) {
+        if (pb.__imeBound) return;
+        pb.__imeBound = true;
+
         if (pb.readOnly) { pb.readOnly = false; }
+        // 让 pasteboard 可见但透明，确保能接收焦点和 IME 事件
+        pb.style.cssText = 'position:fixed;left:0;top:0;width:1px;height:1px;' +
+            'opacity:0;z-index:999999;resize:none;' +
+            'border:none;outline:none;padding:0;margin:0;background:transparent';
 
-        pb.style.cssText = 'position:fixed;left:0;top:0;width:100%;height:100%;' +
-            'opacity:0;pointer-events:none;z-index:999999;resize:none;' +
-            'border:none;outline:none;padding:0;margin:0';
-        console.log('[ime] pasteboard 已就位');
+        console.log('[ime] pasteboard 已就绪:', pb.id);
 
-        var lastSent = '';
-        var sendTimer = null;
-
-        // ══════ 唯一触发：input 事件 ══════
-        // IME 组合完成（空格/回车/点击候选词）后，pasteboard.value 更新，
+        // ══════ 唯一触发：input 事件（isComposing=false 时立即发送）══════
+        // IME 组合完成（空格/回车/点击候选词）后，pasteboard.value 更新为最终中文，
         // 浏览器触发 input 事件且 e.isComposing === false。
-        // 用防抖合并连续输入（避免漏字），300ms 内的输入合并为一次发送。
+        // 立即发送，不用防抖（防抖会导致后续输入覆盖前一次的值）。
         pb.addEventListener('input', function (e) {
-            // 组合中不处理
             if (e.isComposing) {
                 window.__imeComposing = true;
                 return;
@@ -371,16 +390,8 @@
             var text = (pb.value || '').trim();
             if (!text) return;
 
-            // 防抖：300ms 内的连续输入合并
-            if (sendTimer) clearTimeout(sendTimer);
-            sendTimer = setTimeout(function () {
-                var finalText = (pb.value || '').trim();
-                if (finalText && finalText !== lastSent) {
-                    lastSent = finalText;
-                    sendText(finalText);
-                    pb.value = '';  // 清空，准备下一次输入
-                }
-            }, 300);
+            pb.value = '';
+            sendText(text);
         });
 
         // composition 事件仅用于设置状态标志（供剪贴板同步模块检查）
@@ -389,13 +400,12 @@
         });
         pb.addEventListener('compositionend', function () {
             window.__imeComposing = false;
-            // compositionend 后立即检查 value（某些浏览器 input 不触发）
+            // compositionend 后兜底检查（某些浏览器 input 不触发）
             setTimeout(function () {
                 var text = (pb.value || '').trim();
-                if (text && text !== lastSent) {
-                    lastSent = text;
-                    sendText(text);
+                if (text) {
                     pb.value = '';
+                    sendText(text);
                 }
             }, 50);
         });
@@ -404,7 +414,14 @@
             window.__imeComposing = false;
         });
 
-        console.log('[ime] IME 就绪（input 防抖 + compositionend 兜底）');
+        // 点击页面时确保 pasteboard 获得焦点
+        document.addEventListener('click', function () {
+            if (document.activeElement !== pb && !window.__imeComposing) {
+                try { pb.focus({ preventScroll: true }); } catch (e) { pb.focus(); }
+            }
+        }, true);
+
+        console.log('[ime] IME 就绪');
     }
 
     initWhenReady();
