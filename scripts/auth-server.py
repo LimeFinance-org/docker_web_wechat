@@ -268,8 +268,40 @@ class AuthHandler(http.server.BaseHTTPRequestHandler):
         if self.path == "/_type-text":
             self._handle_type_text()
             return
+        # 文件删除（下载后清理临时文件）
+        if self.path == "/_delete-file":
+            self._handle_delete_file()
+            return
         self.send_response(HTTPStatus.NOT_FOUND)
         self.end_headers()
+
+    # ══════════ 文件删除（POST）══════════
+    def _handle_delete_file(self):
+        """删除下载目录中的临时文件"""
+        token = parse_cookie(self.headers.get("Cookie", ""))
+        if not (token and verify_token(token)):
+            self._json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "未登录"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length)) if length > 0 else {}
+        except:
+            body = {}
+        filepath = body.get("path", "")
+        if not filepath or not os.path.isfile(filepath):
+            self._json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "文件不存在"})
+            return
+        # 安全：只允许删除 download 和 temp 目录中的文件，不允许删除 xwechat_files
+        allowed = ["/root/downloads", "/tmp/wechat-paste"]
+        real = os.path.realpath(filepath)
+        if not any(real.startswith(os.path.realpath(d)) for d in allowed):
+            self._json(HTTPStatus.FORBIDDEN, {"ok": False, "error": "无权删除"})
+            return
+        try:
+            os.remove(filepath)
+            self._json(HTTPStatus.OK, {"ok": True})
+        except OSError as e:
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(e)})
 
     def _handle_type_text(self):
         """接收输入法组合完成的文本，用 xdotool type 输入到微信对话框"""

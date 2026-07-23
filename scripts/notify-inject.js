@@ -508,6 +508,22 @@
         setTimeout(function () { document.body.removeChild(a); }, 1000);
         var kb = (file.size / 1024).toFixed(1);
         console.log('[download] 下载: ' + file.name + ' (' + kb + ' KB)');
+
+        // 下载后 3 分钟删除临时文件（仅在 /root/downloads 和 /tmp 中）
+        if (file.path.indexOf('/root/downloads') === 0 ||
+            file.path.indexOf('/tmp/wechat-paste') === 0) {
+            setTimeout(function () {
+                fetch('/_delete-file', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ path: file.path }),
+                    credentials: 'same-origin'
+                }).then(function (r) { return r.json(); })
+                  .then(function (d) {
+                      if (d.ok) console.log('[download] 已清理: ' + file.name);
+                  }).catch(function () {});
+            }, 180000);  // 3 分钟
+        }
     }
 
     setInterval(function () {

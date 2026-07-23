@@ -22,7 +22,18 @@ echo "[auto-save] DISPLAY=$DISPLAY"
 # 记录已处理过的窗口 ID，避免重复处理
 declare -A HANDLED_WINDOWS
 
+# 定期清理计数器（每 60 轮 = 30 秒清理一次旧文件）
+CLEANUP_COUNTER=0
+
 while true; do
+    # ====== 定期清理超过 30 分钟的旧文件 ======
+    CLEANUP_COUNTER=$((CLEANUP_COUNTER + 1))
+    if [ $CLEANUP_COUNTER -ge 60 ]; then
+        CLEANUP_COUNTER=0
+        find "$SAVE_DIR" -type f -mmin +30 -delete 2>/dev/null || true
+        find /tmp/wechat-paste -type f -mmin +30 -delete 2>/dev/null || true
+    fi
+
     # 获取所有窗口列表
     windows=$(wmctrl -l 2>/dev/null || true)
 
