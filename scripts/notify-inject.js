@@ -289,46 +289,66 @@
 })();
 
 // ============== IME 输入法支持 ==============
-// 方案：浏览器 IME 在 Xpra pasteboard 上组合文本 → compositionend 获取中文 →
-//       直接用 client.send 通过 WebSocket 发送 Unicode 字符到 Xpra/WeChat
+// 浏览器 IME 在 Xpra pasteboard 上组合中文 → compositionend → POST /_type-text → xdotool type → 微信
 //
-// 不走服务器端剪贴板（Ctrl+V 在该环境中不可靠），不走 xdotool。
-// Xpra 支持接收 Unicode code point 作为 keycode 的 key-action 包。
-//
-// 拦截：捕获阶段 keydown 在 IME 组合期间 stopPropagation，阻止 Xpra 的
-//       document 冒泡监听器调用 preventDefault 杀死 IME。
+// 安全机制（防止键盘永久卡死）：
+//   - composition 超时重置（10 秒后若未收到 compositionend，强制复位）
+//   - pasteboard 失焦时重置 isComposing
+//   - 页面点击时重置 isComposing
+//   - pasteboard 移到可视区域（left:-99em 会导致浏览器拒绝 IME 组合）
 (function () {
     'use strict';
     if (window.__imeHelperLoaded) return;
     window.__imeHelperLoaded = true;
 
     var isComposing = false;
+    var compositionTimer = null;
+
+    function resetComposing() {
+        isComposing = false;
+        if (compositionTimer) { clearTimeout(compositionTimer); compositionTimer = null; }
+    }
 
     function initWhenReady() {
         var pb = document.getElementById('pasteboard');
         if (!pb) { setTimeout(initWhenReady, 200); return; }
 
+        // 确保 pasteboard 不是 readonly
         if (pb.readOnly) { pb.readOnly = false; }
 
-        // 捕获阶段 keydown：IME 组合时阻止冒泡（Xpra 的 document 监听器会
-        // 调用 preventDefault 杀死 IME），非 IME 时不干预。
+        // 将 pasteboard 移到可视区域（left:-99em 浏览器可能拒绝 IME）
+        pb.style.cssText = 'position:fixed;left:0;top:0;width:100%;height:100%;' +
+            'opacity:0;pointer-events:none;z-index:-1;resize:none;' +
+            'border:none;outline:none;padding:0;margin:0';
+        console.log('[ime] pasteboard 已移到可视区域');
+
+        // 捕获阶段 keydown：IME 组合时阻止冒泡
         pb.addEventListener('keydown', function (e) {
             if (isComposing || e.isComposing || e.keyCode === 229) {
                 e.stopPropagation();
             }
         }, true);
 
+        // ── IME 组合事件 ──
         pb.addEventListener('compositionstart', function () {
             isComposing = true;
+            console.log('[ime] 组合开始');
+            // 安全超时：10 秒后若未收到 compositionend，强制复位
+            if (compositionTimer) clearTimeout(compositionTimer);
+            compositionTimer = setTimeout(function () {
+                if (isComposing) {
+                    console.warn('[ime] 组合超时，强制复位');
+                    resetComposing();
+                }
+            }, 10000);
         });
 
         pb.addEventListener('compositionend', function (e) {
-            isComposing = false;
+            resetComposing();
             var text = e.data || '';
             if (!text) return;
+            console.log('[ime] 组合完成:', text);
 
-            // 通过 HTTP /_type-text → xdotool type 输入到微信
-            // （WebSocket key-action 不支持 Unicode 码点作 X11 keysym，xdotool type 已验证可行）
             fetch('/_type-text', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -341,6 +361,15 @@
               }).catch(function (err) {
                   console.error('[ime] 异常:', err);
               });
+        });
+
+        // 失焦/点击时强制复位（用户切走了，IME 不可能再继续）
+        pb.addEventListener('blur', resetComposing);
+        document.addEventListener('click', function () {
+            if (isComposing) {
+                console.log('[ime] 用户点击，强制复位');
+                resetComposing();
+            }
         });
 
         console.log('[ime] IME 就绪（xdotool type 模式）');
