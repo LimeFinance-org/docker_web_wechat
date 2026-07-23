@@ -194,7 +194,8 @@ class AuthHandler(http.server.BaseHTTPRequestHandler):
         if not (token and verify_token(token)):
             self._json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "未登录"})
             return
-        dirs = ["/root/downloads", "/root/xwechat_files", "/tmp/wechat-paste"]
+        # 只监控下载临时目录，不扫描 xwechat_files（那是微信内部数据，全是缓存/配置/数据库）
+        dirs = ["/root/downloads", "/tmp/wechat-paste"]
         files = []
         for d in dirs:
             if not os.path.isdir(d):
