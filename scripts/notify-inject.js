@@ -376,10 +376,89 @@
 
         console.log('[ime] pasteboard 已就绪:', pb.id);
 
-        // ══════ 唯一触发：input 事件（isComposing=false 时立即发送）══════
-        // IME 组合完成（空格/回车/点击候选词）后，pasteboard.value 更新为最终中文，
+        // ══════ 文本发送队列（保证顺序）══════
+        // 快速连续输入时，多个 fetch 请求可能并发到达服务端。
+        // 队列化确保文本按组合完成的顺序依次发送，避免乱序/漏字。
+        var sendQueue = [];
+        var sending = false;
+        // 标记当前 IME 组合是否已被 input 事件处理，防止 compositionend 兜底重复发送
+        var compositionHandled = false;
+
+        function flushQueue() {
+            if (sending) return;
+            var next = sendQueue.shift();
+            if (!next) return;
+            sending = true;
+            sendTextQueued(next).then(function () {
+                sending = false;
+                if (sendQueue.length) flushQueue();
+            }).catch(function () {
+                sending = false;
+                if (sendQueue.length) flushQueue();
+            });
+        }
+
+        // 队列化发送文本（返回 Promise，便于串行控制）
+        // 优先通过 Xpra 剪贴板 + Ctrl+V 粘贴（不依赖 xdotool type，避免中文丢字）
+        // xdotool type 对中文依赖 XKB keysym 映射，部分字符无法映射到 keycode 导致丢失
+        function sendTextQueued(text) {
+            return new Promise(function (resolve) {
+                var client = window.client;
+                if (client && client.connected) {
+                    // ── 方式1：Xpra 剪贴板 + Ctrl+V（可靠，不丢字）──
+                    try {
+                        // 设置 Xpra 客户端剪贴板缓冲（微信 Ctrl+V 请求时返回此数据）
+                        client.clipboard_buffer = text;
+                        client.clipboard_datatype = "UTF8_STRING";
+                        client.send_clipboard_token(text, ["UTF8_STRING"]);
+
+                        // 等待 Xpra 服务器处理剪贴板更新，然后模拟 Ctrl+V
+                        setTimeout(function () {
+                            try {
+                                var wid = client.focused_wid || 0;
+                                client.send(["key-action", wid, "Control_L", true, [], 17, "", 17, 0]);
+                                client.send(["key-action", wid, "v", true, ["control"], 86, "v", 86, 0]);
+                                client.send(["key-action", wid, "v", false, ["control"], 86, "v", 86, 0]);
+                                client.send(["key-action", wid, "Control_L", false, [], 17, "", 17, 0]);
+                            } catch (e) {
+                                console.error('[ime] Ctrl+V 模拟失败:', e);
+                            }
+                            // 等待粘贴完成后再处理队列中下一个
+                            setTimeout(function () { resolve({ ok: true }); }, 80);
+                        }, 120);
+                    } catch (e) {
+                        console.error('[ime] 剪贴板方式失败，回退 HTTP:', e);
+                        sendTextViaHttp(text).then(resolve).catch(function () { resolve({ ok: false }); });
+                    }
+                } else {
+                    // ── 方式2：HTTP 回退（xdotool type，可能丢字）──
+                    sendTextViaHttp(text).then(resolve).catch(function () { resolve({ ok: false }); });
+                }
+            });
+        }
+
+        function sendTextViaHttp(text) {
+            return new Promise(function (resolve, reject) {
+                fetch('/_type-text', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ text: text }),
+                    credentials: 'same-origin'
+                }).then(function (r) { return r.json(); })
+                  .then(function (d) { resolve(d); })
+                  .catch(reject);
+            });
+        }
+
+        function enqueueText(text) {
+            if (!text) return;
+            sendQueue.push(text);
+            flushQueue();
+        }
+
+        // ══════ input 事件（isComposing=false 时立即发送）══════
+        // IME 组合完成后，pasteboard.value 更新为最终中文，
         // 浏览器触发 input 事件且 e.isComposing === false。
-        // 立即发送，不用防抖（防抖会导致后续输入覆盖前一次的值）。
         pb.addEventListener('input', function (e) {
             if (e.isComposing) {
                 window.__imeComposing = true;
@@ -391,7 +470,8 @@
             if (!text) return;
 
             pb.value = '';
-            sendText(text);
+            compositionHandled = true;  // 标记已处理，防止 compositionend 兜底重复发送
+            enqueueText(text);
         });
 
         // composition 事件仅用于设置状态标志（供剪贴板同步模块检查）
@@ -400,14 +480,22 @@
         });
         pb.addEventListener('compositionend', function () {
             window.__imeComposing = false;
+            // 重置标志：新的组合结束，等待 input 事件处理
+            compositionHandled = false;
             // compositionend 后兜底检查（某些浏览器 input 不触发）
-            setTimeout(function () {
+            // 用 requestAnimationFrame 确保在浏览器渲染周期内执行，
+            // 并检查 __imeComposing 避免在新的组合期间破坏 pb.value
+            requestAnimationFrame(function () {
+                // 如果已开始新的 IME 组合，绝对不能清空 pb.value
+                if (window.__imeComposing) return;
+                // 如果 input 事件已经处理了，跳过（避免重复发送）
+                if (compositionHandled) return;
                 var text = (pb.value || '').trim();
                 if (text) {
                     pb.value = '';
-                    sendText(text);
+                    enqueueText(text);
                 }
-            }, 50);
+            });
         });
 
         pb.addEventListener('blur', function () {
@@ -428,11 +516,11 @@
 })();
 
 // ============== 剪贴板同步（WeChat → 浏览器系统剪贴板）==============
-// 原理：定时轮询 X11 剪贴板（xclip -o），缓存最新文本；在用户交互（点击、
-// 输入法确认等用户手势事件）中调用 execCommand('copy') 写入系统剪贴板。
+// 原理：定时轮询 X11 剪贴板（xclip -o），缓存最新文本；在用户交互手势中
+// 调用 navigator.clipboard.writeText / execCommand('copy') 写入系统剪贴板。
 //
-// 关键：HTTP 页面 execCommand('copy') 需要用户手势才能生效，
-// setInterval 中调用会静默失败。所以采用"缓存+手势触发"模式。
+// 关键：HTTP 页面写系统剪贴板需要用户手势，所以采用"缓存+手势触发"模式。
+// 触发时机：click / mousedown / keyup（覆盖复制后各种操作场景）
 (function () {
     'use strict';
     if (window.__clipboardSyncLoaded) return;
@@ -449,12 +537,27 @@
         // IME 组合期间绝对不能动焦点（会杀死中文输入）
         if (window.__imeComposing) return;
 
+        var textToCopy = cachedText;
+        // 优先用 navigator.clipboard.writeText（异步 API，更可靠）
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(textToCopy).then(function () {
+                lastApplied = textToCopy;
+                console.log('[clipboard] 同步(navigator): ' + textToCopy.substring(0, 40));
+            }).catch(function () {
+                // 失败时回退到 execCommand
+                execCopyFallback(textToCopy);
+            });
+        } else {
+            execCopyFallback(textToCopy);
+        }
+    }
+
+    function execCopyFallback(text) {
         var ta = document.createElement('textarea');
-        ta.value = cachedText;
+        ta.value = text;
         ta.setAttribute('readonly', '');
         ta.style.cssText = 'position:fixed;left:-9999px;top:-9999px;opacity:0';
         document.body.appendChild(ta);
-        // 用 Selection API 而非 focus()，减少对 pasteboard 焦点的影响
         var sel = window.getSelection();
         var range = document.createRange();
         range.selectNodeContents(ta);
@@ -463,8 +566,8 @@
         try {
             var ok = document.execCommand('copy');
             if (ok) {
-                lastApplied = cachedText;
-                console.log('[clipboard] 同步: ' + cachedText.substring(0, 40));
+                lastApplied = text;
+                console.log('[clipboard] 同步(exec): ' + text.substring(0, 40));
             }
         } catch (e) {}
         sel.removeAllRanges();
@@ -480,13 +583,15 @@
                     cachedText = d.text;
                 }
             }).catch(function () {});
-    }, 1500);
+    }, 800);
 
-    // 只在 click 时尝试同步（用户主动点击，不会干扰 IME）
-    // 注意：不再在 compositionend/keydown 时触发，避免抢焦点
+    // 多手势触发：click / mousedown / keyup
+    // 覆盖用户复制后切窗口、按键等场景，尽快同步到系统剪贴板
     document.addEventListener('click', tryApplyClipboard, true);
+    document.addEventListener('mousedown', tryApplyClipboard, true);
+    document.addEventListener('keyup', tryApplyClipboard, true);
 
-    console.log('[clipboard] 剪贴板同步就绪（缓存+手势触发）');
+    console.log('[clipboard] 剪贴板同步就绪（缓存+多手势触发）');
 })();
 
 // ============== 文件下载监控（微信保存图片/文件 → 浏览器下载）==============
