@@ -178,14 +178,12 @@ class AuthHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def _handle_type_text(self):
-        """接收输入法组合完成的文本，通过剪贴板 + Ctrl+V 输入到微信对话框"""
-        # 校验登录状态
+        """接收输入法组合完成的文本，用 xdotool type 输入到微信对话框"""
         token = parse_cookie(self.headers.get("Cookie", ""))
         if not (token and verify_token(token)):
             self._json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "未登录"})
             return
 
-        # 读取 JSON body
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
@@ -206,53 +204,31 @@ class AuthHandler(http.server.BaseHTTPRequestHandler):
             self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "文本为空"})
             return
 
-        # 安全限制：最多 500 字符
         if len(text) > 500:
             text = text[:500]
 
         display = os.environ.get("DISPLAY", ":100")
         env = {**os.environ, "DISPLAY": display}
 
-        # 方案：xclip 设置剪贴板 + xdotool 模拟 Ctrl+V
-        # xdotool type 对中文字符的按键映射不可靠，改用剪贴板粘贴方式
+        # 使用 xdotool type（XKB 修复后应能正确处理中文）
+        # 先确保键盘焦点在微信窗口上
         try:
-            # 先杀掉之前的 xclip 进程避免冲突
-            subprocess.run(["pkill", "-f", "xclip"], capture_output=True, timeout=2)
-        except Exception:
-            pass
-
-        try:
-            # 用 Popen 启动 xclip，写入中文文本后关闭 stdin
-            proc = subprocess.Popen(
-                ["xclip", "-selection", "clipboard"],
-                stdin=subprocess.PIPE,
-                env=env
-            )
-            proc.stdin.write(text.encode("utf-8"))
-            proc.stdin.close()
-            # 不等待退出，xclip 需要保持运行持有剪贴板所有权
-        except FileNotFoundError:
-            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": "xclip 未安装"})
-            return
-        except Exception as e:
-            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": f"xclip 异常: {e}"})
-            return
-
-        # 延迟后模拟 Ctrl+V 粘贴
-        try:
-            # 短暂等待确保 xclip 就绪
-            import time as _time
-            _time.sleep(0.1)
             subprocess.run(
-                ["xdotool", "key", "--clearmodifiers", "ctrl+v"],
+                ["xdotool", "type", "--clearmodifiers", "--delay", "10", text],
                 capture_output=True,
-                timeout=5,
+                timeout=10,
                 env=env
             )
-            sys.stdout.write(f"[auth-server] 剪贴板+粘贴 输入: {text[:50]}...\n")
+            sys.stdout.write(f"[auth-server] xdotool type: {text[:50]}...\n")
             sys.stdout.flush()
+        except FileNotFoundError:
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": "xdotool 未安装"})
+            return
+        except subprocess.TimeoutExpired:
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": "超时"})
+            return
         except Exception as e:
-            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": f"xdotool 异常: {e}"})
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(e)})
             return
 
         self._json(HTTPStatus.OK, {"ok": True, "length": len(text)})

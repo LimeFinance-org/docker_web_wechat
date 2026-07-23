@@ -289,95 +289,61 @@
 })();
 
 // ============== IME 输入法支持 ==============
-// 根本原因：
-//   Xpra HTML5 客户端自带 #pasteboard textarea 并始终保持聚焦（enable_clipboard_autofocus）。
-//   Xpra 的 document 冒泡阶段 keydown 监听器调用 e.preventDefault()，这会立即终止
-//   浏览器 IME 组合会话。IME 需要可编辑元素来组合文本，#pasteboard 正好满足。
+// 方案：浏览器 IME 在 Xpra pasteboard 上组合文本 → compositionend 获取中文 →
+//       直接用 client.send 通过 WebSocket 发送 Unicode 字符到 Xpra/WeChat
 //
-// 方案（直接复用 Xpra 的 pasteboard）：
-//   1. 在 #pasteboard 上添加捕获阶段 keydown 监听
-//      - IME 组合中 → stopPropagation()，阻止冒泡到 Xpra 的 document 监听器
-//      - 非 IME → 不干预，Xpra 正常处理
-//   2. 监听 #pasteboard 上的 compositionstart / compositionend
-//   3. compositionend → POST /_type-text → xdotool type 输入到微信
+// 不走服务器端剪贴板（Ctrl+V 在该环境中不可靠），不走 xdotool。
+// Xpra 支持接收 Unicode code point 作为 keycode 的 key-action 包。
+//
+// 拦截：捕获阶段 keydown 在 IME 组合期间 stopPropagation，阻止 Xpra 的
+//       document 冒泡监听器调用 preventDefault 杀死 IME。
 (function () {
     'use strict';
     if (window.__imeHelperLoaded) return;
     window.__imeHelperLoaded = true;
 
     var isComposing = false;
-    var typeLock = false;
-    var savedPasteboardValue = '';
 
-    // 等待 Xpra 创建 pasteboard 后初始化
     function initWhenReady() {
         var pb = document.getElementById('pasteboard');
-        if (!pb) {
-            setTimeout(initWhenReady, 200);
-            return;
-        }
+        if (!pb) { setTimeout(initWhenReady, 200); return; }
 
-        // 确保 pasteboard 不是 readonly（浏览器 IME 不能在 readonly 元素上组合）
-        if (pb.readOnly) {
-            pb.readOnly = false;
-            console.log('[ime] pasteboard readonly 已取消');
-        }
+        if (pb.readOnly) { pb.readOnly = false; }
 
-        // ── 捕获阶段 keydown：IME 中阻止冒泡，非 IME 不干预 ──
+        // 捕获阶段 keydown：IME 组合时阻止冒泡（Xpra 的 document 监听器会
+        // 调用 preventDefault 杀死 IME），非 IME 时不干预。
         pb.addEventListener('keydown', function (e) {
             if (isComposing || e.isComposing || e.keyCode === 229) {
-                // IME 组合中：阻止冒泡到 document（阻止 Xpra 的 preventDefault 杀死 IME）
                 e.stopPropagation();
-                // 不调用 preventDefault — 让浏览器 IME 正常处理
             }
-            // 非 IME：不做任何处理，事件正常冒泡到 document → Xpra 处理
         }, true);
 
-        // ── IME 组合事件 ──
         pb.addEventListener('compositionstart', function () {
             isComposing = true;
-            savedPasteboardValue = pb.value || '';
-            console.log('[ime] 组合开始');
-        });
-
-        pb.addEventListener('compositionupdate', function (e) {
-            console.log('[ime] 组合中:', e.data);
         });
 
         pb.addEventListener('compositionend', function (e) {
             isComposing = false;
             var text = e.data || '';
-            if (!text || typeLock) {
-                console.log('[ime] 组合结束，无文本');
-                return;
-            }
+            if (!text) return;
 
-            console.log('[ime] 组合完成:', text);
-
-            // 恢复 pasteboard 原始值
-            pb.value = savedPasteboardValue;
-
-            typeLock = true;
+            // 通过 HTTP /_type-text → xdotool type 输入到微信
+            // （WebSocket key-action 不支持 Unicode 码点作 X11 keysym，xdotool type 已验证可行）
             fetch('/_type-text', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ text: text }),
                 credentials: 'same-origin'
-            }).then(function (resp) { return resp.json(); })
-              .then(function (data) {
-                  if (data.ok) {
-                      console.log('[ime] 已输入:', text);
-                  } else {
-                      console.error('[ime] 输入失败:', data.error);
-                  }
+            }).then(function (r) { return r.json(); })
+              .then(function (d) {
+                  if (d.ok) console.log('[ime] 已输入:', text);
+                  else console.error('[ime] 失败:', d.error);
               }).catch(function (err) {
-                  console.error('[ime] 请求异常:', err);
-              }).finally(function () {
-                  setTimeout(function () { typeLock = false; }, 100);
+                  console.error('[ime] 异常:', err);
               });
         });
 
-        console.log('[ime] IME 支持已就绪（复用 Xpra pasteboard）');
+        console.log('[ime] IME 就绪（xdotool type 模式）');
     }
 
     initWhenReady();

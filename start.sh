@@ -148,6 +148,7 @@ exec xpra start "${DISPLAY}" \
     --bind-ws="127.0.0.1:${XPRA_PORT}" \
     --html=on \
     --start-child="openbox" \
+    --start-child="bash -c 'sleep 1 && setxkbmap us'" \
     --start-child-late="/usr/local/bin/start-wechat.sh" \
     --exit-with-children=yes \
     --encoding="${XPRA_ENCODING}" \

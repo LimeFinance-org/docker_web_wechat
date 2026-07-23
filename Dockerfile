@@ -33,6 +33,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         xpra xpra-html5 xpra-x11 \
         # X server 与工具
         xvfb x11-xserver-utils x11-utils \
+        # XKB 键盘布局数据（中文/Unicode 输入必需！缺此包会出现 "XKB bindings not available"）
+        xkb-data \
         # 音频
         pulseaudio pulseaudio-utils \
         # 视频编码（提升画质的关键）
@@ -56,9 +58,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         #   wmctrl  - 查询 X11 窗口标题（解析未读消息数）
         #   python3 - 运行 notify-watcher.py
         #   procps  - 提供 pgrep 检测微信进程是否在运行
-        #   xdotool - 模拟鼠标点击（Xpra HTML5 客户端点击事件传递不完整时的备选）
+        #   xdotool - 模拟键盘输入（xdotool type 需配合 XKB 才能输入中文）
         #   xclip   - 设置 X11 剪贴板（文件粘贴时写入 text/uri-list）
-        wmctrl python3 procps xdotool xclip \
+        #   xsel    - 更可靠的 X11 剪贴板工具（支持 --keep 保持选择区）
+        wmctrl python3 procps xdotool xclip xsel \
         # 容器内 Nginx：反向代理 + auth_request 会话认证
         #   nginx  - Web 服务器（auth_request 模块内置）
         nginx \
