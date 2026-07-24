@@ -190,6 +190,60 @@
     setTimeout(checkStatus, 1500);
 })();
 
+// ============== 禁用 Xpra 客户端剪贴板干扰 ==============
+// 根因：用户输入中文后，服务端 xclip 设置 X11 剪贴板 → Xpra 服务器发送
+// clipboard-token 到浏览器 → _process_clipboard_token 设置 clipboard_pending=true。
+// 之后用户按键时 #screen 的 keypress 事件触发 may_set_clipboard()，
+// 它执行 pasteboard.text(clipboard_buffer) + pasteboard.select()，
+// 覆盖并选中了 pasteboard 中正在组合的 IME 文本，导致中文输入变成英文。
+//
+// 修复：覆盖 may_set_clipboard 为空函数，并定期清除 clipboard_pending。
+// 我们有自己的 xclip 轮询机制（/_clipboard-text 端点）来同步微信→浏览器剪贴板，
+// 不需要 Xpra 客户端的 may_set_clipboard。
+(function () {
+    'use strict';
+    if (window.__xpraClipboardDisabled) return;
+    window.__xpraClipboardDisabled = true;
+
+    function disableXpraClipboardInterference() {
+        var client = window.client;
+        if (!client || client.__maySetClipboardPatched) return;
+        client.__maySetClipboardPatched = true;
+
+        // 覆盖 may_set_clipboard：原方法会在 click/keypress 时操作 pasteboard，
+        // 调用 pasteboard.text() 和 pasteboard.select()，破坏正在进行的 IME 组合
+        client.may_set_clipboard = function () {};
+
+        // 覆盖 _poll_clipboard：原方法会主动读取浏览器剪贴板，
+        // 可能触发 clipboard_token 发送，干扰我们的输入流程
+        client._poll_clipboard = function () { return false; };
+
+        // 覆盖 read_clipboard：防止主动读取浏览器剪贴板
+        client.read_clipboard = function () { return false; };
+
+        console.log('[clipboard] 已禁用 Xpra may_set_clipboard / _poll_clipboard / read_clipboard');
+    }
+
+    // client 可能在本脚本之后才创建，用轮询确保覆盖
+    var retryCount = 0;
+    var patchTimer = setInterval(function () {
+        disableXpraClipboardInterference();
+        if ((window.client && window.client.__maySetClipboardPatched) || ++retryCount > 150) {
+            clearInterval(patchTimer);
+        }
+    }, 100);
+
+    // 定期清除 clipboard_pending（双保险，防止 _process_clipboard_token 设置后残留）
+    setInterval(function () {
+        var client = window.client;
+        if (client && client.clipboard_pending) {
+            client.clipboard_pending = false;
+        }
+    }, 50);
+
+    console.log('[clipboard] Xpra 剪贴板干扰禁用模块已加载');
+})();
+
 // ============== 文件/图片粘贴支持 ==============
 // 合并到 notify-inject.js 中，避免单独加载 paste-helper.js 时的网络问题
 (function () {
@@ -314,13 +368,18 @@
 })();
 
 // ============== IME 输入法支持 + 文本粘贴 ==============
-// 和图片/文件粘贴完全相同的思路：用 paste 事件捕获数据。
 //
-// 原理：
+// 架构：
 //   - 浏览器 IME 在 pasteboard textarea 上组合中文
-//   - 组合完成时，部分浏览器会触发 paste 事件（data 含最终文本）
-//   - 如果没触发 paste，则用 input 事件（isComposing=false）兜底
-//   - 文本通过 /_type-text 端点用 xdotool type 输入到微信
+//   - input/composition 事件在 window 捕获阶段拦截，阻止 Xpra 的 init_tablet_input
+//   - 文本通过 /_type-text 端点发送到服务端
+//   - 服务端用 xclip 设置剪贴板 + xdotool key ctrl+v 粘贴到微信
+//
+// 焦点守卫（关键！解决"第三次输入变成英文"的问题）：
+//   - pasteboard blur 时立即夺回焦点
+//   - 每 10ms 轮询 activeElement，确保始终聚焦 pasteboard
+//   - 覆盖 Xpra 的 set_focus，防止它把焦点从 pasteboard 移走
+//   - document 捕获阶段拦截 keydown，确保键盘事件先到 pasteboard
 (function () {
     'use strict';
     if (window.__imeHelperLoaded) return;
@@ -337,10 +396,8 @@
     }
 
     function initWhenReady() {
-        // 等待 Xpra 的 #pasteboard 元素出现（Xpra 连接后动态创建）
         var pb = document.getElementById('pasteboard');
         if (!pb) {
-            // 用 MutationObserver 等待 pasteboard 被创建
             var observer = new MutationObserver(function (mutations, obs) {
                 var el = document.getElementById('pasteboard');
                 if (el) {
@@ -349,7 +406,6 @@
                 }
             });
             observer.observe(document.body, { childList: true, subtree: true });
-            // 同时设置超时轮询作为备份
             var retryCount = 0;
             var retryTimer = setInterval(function () {
                 var el = document.getElementById('pasteboard');
@@ -369,19 +425,15 @@
         pb.__imeBound = true;
 
         if (pb.readOnly) { pb.readOnly = false; }
-        // 让 pasteboard 可见但透明，确保能接收焦点和 IME 事件
         pb.style.cssText = 'position:fixed;left:0;top:0;width:1px;height:1px;' +
             'opacity:0;z-index:999999;resize:none;' +
             'border:none;outline:none;padding:0;margin:0;background:transparent';
 
         console.log('[ime] pasteboard 已就绪:', pb.id);
 
-        // ══════ 文本发送队列（保证顺序）══════
-        // 快速连续输入时，多个 fetch 请求可能并发到达服务端。
-        // 队列化确保文本按组合完成的顺序依次发送，避免乱序/漏字。
+        // ══════ 文本发送队列 ══════
         var sendQueue = [];
         var sending = false;
-        // 标记当前 IME 组合是否已被 input 事件处理，防止 compositionend 兜底重复发送
         var compositionHandled = false;
 
         function flushQueue() {
@@ -398,42 +450,9 @@
             });
         }
 
-        // 队列化发送文本（返回 Promise，便于串行控制）
-        // 优先通过 Xpra 剪贴板 + Ctrl+V 粘贴（不依赖 xdotool type，避免中文丢字）
-        // xdotool type 对中文依赖 XKB keysym 映射，部分字符无法映射到 keycode 导致丢失
         function sendTextQueued(text) {
             return new Promise(function (resolve) {
-                var client = window.client;
-                if (client && client.connected) {
-                    // ── 方式1：Xpra 剪贴板 + Ctrl+V（可靠，不丢字）──
-                    try {
-                        // 设置 Xpra 客户端剪贴板缓冲（微信 Ctrl+V 请求时返回此数据）
-                        client.clipboard_buffer = text;
-                        client.clipboard_datatype = "UTF8_STRING";
-                        client.send_clipboard_token(text, ["UTF8_STRING"]);
-
-                        // 等待 Xpra 服务器处理剪贴板更新，然后模拟 Ctrl+V
-                        setTimeout(function () {
-                            try {
-                                var wid = client.focused_wid || 0;
-                                client.send(["key-action", wid, "Control_L", true, [], 17, "", 17, 0]);
-                                client.send(["key-action", wid, "v", true, ["control"], 86, "v", 86, 0]);
-                                client.send(["key-action", wid, "v", false, ["control"], 86, "v", 86, 0]);
-                                client.send(["key-action", wid, "Control_L", false, [], 17, "", 17, 0]);
-                            } catch (e) {
-                                console.error('[ime] Ctrl+V 模拟失败:', e);
-                            }
-                            // 等待粘贴完成后再处理队列中下一个
-                            setTimeout(function () { resolve({ ok: true }); }, 80);
-                        }, 120);
-                    } catch (e) {
-                        console.error('[ime] 剪贴板方式失败，回退 HTTP:', e);
-                        sendTextViaHttp(text).then(resolve).catch(function () { resolve({ ok: false }); });
-                    }
-                } else {
-                    // ── 方式2：HTTP 回退（xdotool type，可能丢字）──
-                    sendTextViaHttp(text).then(resolve).catch(function () { resolve({ ok: false }); });
-                }
+                sendTextViaHttp(text).then(resolve).catch(function () { resolve({ ok: false }); });
             });
         }
 
@@ -456,39 +475,205 @@
             flushQueue();
         }
 
-        // ══════ input 事件（isComposing=false 时立即发送）══════
-        // IME 组合完成后，pasteboard.value 更新为最终中文，
-        // 浏览器触发 input 事件且 e.isComposing === false。
-        pb.addEventListener('input', function (e) {
-            if (e.isComposing) {
-                window.__imeComposing = true;
+        // ══════ 强力焦点守卫 ══════
+        // 解决"第三次输入变成英文"的核心：确保 pasteboard 永远持有焦点。
+        // 如果 pasteboard 失焦，键盘事件会被 Xpra 的 document keydown 监听器捕获，
+        // 直接发送 key-action 到服务器 → 变成英文。
+
+        var focusGuardActive = false;
+        var lastFocusLog = 0;
+        window.__focusGuardActive = false;
+
+        function ensurePasteboardFocus(reason) {
+            if (document.activeElement === pb) return;
+            if (!pb) return;
+            try {
+                pb.focus({ preventScroll: true });
+            } catch (e) {
+                try { pb.focus(); } catch (e2) {}
+            }
+            var now = Date.now();
+            if (now - lastFocusLog > 1000) {
+                console.log('[ime] 焦点守卫夺回焦点:', reason, 'prev=', document.activeElement && document.activeElement.tagName);
+                lastFocusLog = now;
+            }
+        }
+
+        // 1. pasteboard blur 时立即夺回
+        pb.addEventListener('blur', function () {
+            window.__imeComposing = false;
+            // 用 setTimeout 确保在 blur 事件完成后再聚焦
+            setTimeout(function () { ensurePasteboardFocus('blur'); }, 0);
+        });
+
+        // 2. 每 10ms 轮询焦点（最可靠的方式）
+        setInterval(function () {
+            if (!focusGuardActive) return;
+            ensurePasteboardFocus('poll');
+        }, 10);
+
+        // 3. document 捕获阶段拦截 keydown/keyup
+        // 关键修复：阻止 Xpra 的 _keyb_process 处理 pasteboard 有焦点时的所有按键
+        // 根因：Xpra 的 _keyb_process 对键盘事件调用 e.preventDefault() 和发送 key-action，
+        // 经过两次 IME 组合后破坏了 IME 的状态，导致第三次输入时 IME 不启动组合。
+        // 修复：在捕获阶段拦截所有按键，用 stopImmediatePropagation 阻止 Xpra 处理。
+        // 功能键（回车、退格等）通过我们自己发送 key-action 到 Xpra。
+        var FUNCTION_KEYS = {
+            'Enter': 'Return', 'Backspace': 'BackSpace', 'Delete': 'Delete',
+            'Tab': 'Tab', 'Escape': 'Escape',
+            'ArrowUp': 'Up', 'ArrowDown': 'Down', 'ArrowLeft': 'Left', 'ArrowRight': 'Right',
+            'Home': 'Home', 'End': 'End', 'PageUp': 'Page_Up', 'PageDown': 'Page_Down'
+        };
+
+        function sendKeyAction(keyname, pressed, modifiers, keystring, keycode) {
+            var client = window.client;
+            if (!client || !client.connected) return;
+            var wid = client.focused_wid || client.topwindow || 0;
+            client.send(["key-action", wid, keyname, pressed, modifiers || [], keycode || 0, keystring || '', keycode || 0, 0]);
+        }
+
+        document.addEventListener('keydown', function (e) {
+            if (!focusGuardActive) return;
+            if (document.activeElement !== pb) return;
+
+            // 修饰键组合（Ctrl+C/X/V/A 等）：让 Xpra 处理
+            if (e.ctrlKey || e.altKey || e.metaKey) {
                 return;
             }
-            window.__imeComposing = false;
 
+            // 功能键：自己发送 key-action，阻止 Xpra 处理
+            if (FUNCTION_KEYS[e.key]) {
+                sendKeyAction(FUNCTION_KEYS[e.key], true);
+                e.stopImmediatePropagation();
+                e.preventDefault();
+                return;
+            }
+
+            // F1-F12：让 Xpra 处理
+            if (e.key && e.key.startsWith('F') && e.key.length <= 3) {
+                return;
+            }
+
+            // 其他所有按键（字母、数字、空格、IME 组合键等）：
+            // 阻止 Xpra 处理，让 IME 有机会启动组合
+            e.stopImmediatePropagation();
+        }, true);
+
+        document.addEventListener('keyup', function (e) {
+            if (!focusGuardActive) return;
+            if (document.activeElement !== pb) return;
+
+            // 修饰键组合：让 Xpra 处理
+            if (e.ctrlKey || e.altKey || e.metaKey) {
+                return;
+            }
+
+            // 功能键：自己发送 key-action，阻止 Xpra 处理
+            if (FUNCTION_KEYS[e.key]) {
+                sendKeyAction(FUNCTION_KEYS[e.key], false);
+                e.stopImmediatePropagation();
+                e.preventDefault();
+                return;
+            }
+
+            // F1-F12：让 Xpra 处理
+            if (e.key && e.key.startsWith('F') && e.key.length <= 3) {
+                return;
+            }
+
+            // 其他所有按键：阻止 Xpra 处理
+            e.stopImmediatePropagation();
+        }, true);
+
+        // 4. 覆盖 Xpra client.set_focus，防止它把焦点从 pasteboard 移走
+        function patchClientFocus() {
+            var client = window.client;
+            if (!client || client.__focusPatched) return;
+            client.__focusPatched = true;
+
+            var origSetFocus = client.set_focus.bind(client);
+            client.set_focus = function (win) {
+                // 只更新内部状态（focused_wid），不改变 DOM 焦点
+                if (win && win.wid && client.focused_wid !== win.wid) {
+                    // 调用原始 set_focus 更新状态
+                    origSetFocus(win);
+                    // 但立即把 DOM 焦点夺回 pasteboard
+                    setTimeout(function () { ensurePasteboardFocus('set_focus'); }, 0);
+                } else {
+                    origSetFocus(win);
+                }
+            };
+            console.log('[ime] 已覆盖 Xpra set_focus');
+        }
+
+        // 等待 client 对象创建后 patch
+        var patchRetry = 0;
+        var patchTimer = setInterval(function () {
+            if (window.client && window.client.set_focus) {
+                patchClientFocus();
+                clearInterval(patchTimer);
+            } else if (++patchRetry > 150) {
+                clearInterval(patchTimer);
+            }
+        }, 100);
+
+        // 5. 点击页面时确保 pasteboard 获得焦点（用户主动点击，启动焦点守卫）
+        document.addEventListener('click', function () {
+            focusGuardActive = true;
+            if (document.activeElement !== pb) {
+                ensurePasteboardFocus('click');
+            }
+        }, true);
+
+        // 6. 首次连接后激活焦点守卫
+        function activateFocusGuard() {
+            focusGuardActive = true;
+            window.__focusGuardActive = true;
+            ensurePasteboardFocus('init');
+            console.log('[ime] 焦点守卫已激活');
+        }
+
+        if (document.readyState === 'complete' || document.readyState === 'interactive') {
+            setTimeout(activateFocusGuard, 500);
+        } else {
+            window.addEventListener('load', function () {
+                setTimeout(activateFocusGuard, 500);
+            });
+        }
+
+        // ══════ 在 window 捕获阶段拦截 input/composition 事件 ══════
+        function handleInputCapture(e) {
+            if (e.target.id !== 'pasteboard') return;
+
+            if (e.isComposing) {
+                window.__imeComposing = true;
+                e.stopImmediatePropagation();
+                return;
+            }
+
+            window.__imeComposing = false;
             var text = (pb.value || '').trim();
-            if (!text) return;
-
+            if (!text) {
+                e.stopImmediatePropagation();
+                return;
+            }
             pb.value = '';
-            compositionHandled = true;  // 标记已处理，防止 compositionend 兜底重复发送
+            compositionHandled = true;
             enqueueText(text);
-        });
+            e.stopImmediatePropagation();
+        }
 
-        // composition 事件仅用于设置状态标志（供剪贴板同步模块检查）
-        pb.addEventListener('compositionstart', function () {
+        function handleCompositionStartCapture(e) {
+            if (e.target.id !== 'pasteboard') return;
             window.__imeComposing = true;
-        });
-        pb.addEventListener('compositionend', function () {
+        }
+
+        function handleCompositionEndCapture(e) {
+            if (e.target.id !== 'pasteboard') return;
             window.__imeComposing = false;
-            // 重置标志：新的组合结束，等待 input 事件处理
             compositionHandled = false;
-            // compositionend 后兜底检查（某些浏览器 input 不触发）
-            // 用 requestAnimationFrame 确保在浏览器渲染周期内执行，
-            // 并检查 __imeComposing 避免在新的组合期间破坏 pb.value
             requestAnimationFrame(function () {
-                // 如果已开始新的 IME 组合，绝对不能清空 pb.value
                 if (window.__imeComposing) return;
-                // 如果 input 事件已经处理了，跳过（避免重复发送）
                 if (compositionHandled) return;
                 var text = (pb.value || '').trim();
                 if (text) {
@@ -496,20 +681,13 @@
                     enqueueText(text);
                 }
             });
-        });
+        }
 
-        pb.addEventListener('blur', function () {
-            window.__imeComposing = false;
-        });
+        window.addEventListener('input', handleInputCapture, true);
+        window.addEventListener('compositionstart', handleCompositionStartCapture, true);
+        window.addEventListener('compositionend', handleCompositionEndCapture, true);
 
-        // 点击页面时确保 pasteboard 获得焦点
-        document.addEventListener('click', function () {
-            if (document.activeElement !== pb && !window.__imeComposing) {
-                try { pb.focus({ preventScroll: true }); } catch (e) { pb.focus(); }
-            }
-        }, true);
-
-        console.log('[ime] IME 就绪');
+        console.log('[ime] IME 就绪（强力焦点守卫 + 捕获阶段拦截）');
     }
 
     initWhenReady();

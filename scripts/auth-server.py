@@ -341,7 +341,7 @@ class AuthHandler(http.server.BaseHTTPRequestHandler):
             self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(e)})
 
     def _handle_type_text(self):
-        """接收输入法组合完成的文本，用 xdotool type 输入到微信对话框"""
+        """接收输入法组合完成的文本，用 xclip 设置剪贴板 + xdotool key ctrl+v 粘贴"""
         token = parse_cookie(self.headers.get("Cookie", ""))
         if not (token and verify_token(token)):
             self._json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "未登录"})
@@ -373,21 +373,33 @@ class AuthHandler(http.server.BaseHTTPRequestHandler):
         display = os.environ.get("DISPLAY", ":100")
         env = {**os.environ, "DISPLAY": display}
 
-        # 使用 xdotool type（XKB 修复后应能正确处理中文）
-        # 加锁串行执行，避免并发请求导致字符乱序/丢失
-        # --delay 1：按键间隔 1ms（原 10ms 太慢，快速输入时请求堆积导致漏字）
+        # 用 xclip 设置 X11 剪贴板文本，然后 xdotool key ctrl+v 粘贴
+        # 不使用 xdotool type（中文 keysym 映射问题导致丢字）
+        # 不在浏览器端模拟 key-action（会触发 Xpra 客户端副作用导致 IME 失焦）
         try:
             with TYPE_LOCK:
-                subprocess.run(
-                    ["xdotool", "type", "--clearmodifiers", "--delay", "1", text],
-                    capture_output=True,
-                    timeout=10,
+                # 先杀掉之前的 xclip 进程（它可能持有剪贴板所有权）
+                subprocess.run(["pkill", "-f", "xclip"], capture_output=True, timeout=2)
+                # 用 xclip 设置剪贴板文本（Popen 保持 xclip 运行以持有所有权）
+                proc = subprocess.Popen(
+                    ["xclip", "-selection", "clipboard"],
+                    stdin=subprocess.PIPE,
                     env=env
                 )
-            sys.stdout.write(f"[auth-server] xdotool type: {text[:50]}...\n")
+                proc.stdin.write(text.encode("utf-8"))
+                proc.stdin.close()
+                proc.wait(timeout=2)
+                # 等待剪贴板设置完成
+                time.sleep(0.05)
+                # 模拟 Ctrl+V 粘贴
+                subprocess.run(
+                    ["xdotool", "key", "ctrl+v"],
+                    capture_output=True, timeout=5, env=env
+                )
+            sys.stdout.write(f"[auth-server] 剪贴板粘贴: {text[:50]}...\n")
             sys.stdout.flush()
         except FileNotFoundError:
-            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": "xdotool 未安装"})
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": "xdotool/xclip 未安装"})
             return
         except subprocess.TimeoutExpired:
             self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": "超时"})
